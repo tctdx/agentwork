@@ -23,8 +23,8 @@
  * (POST /api/sites/:id/reverify): same check as the weekly one, plus a fresh screenshot.
  */
 import puppeteer from "@cloudflare/puppeteer";
-import { GENESIS, MAX_FAILS, RECHECK_EVERY_MS } from "./constants";
-import { agentPage, agentsMd, homePage, logPage, notFoundPage, privacyPage, sitePage, styles } from "./pages";
+import { GENESIS, MAX_FAILS, PAGE_SIZE, RECHECK_EVERY_MS } from "./constants";
+import { agentPage, agentsIndexPage, agentsMd, homePage, logPage, notFoundPage, privacyPage, sitePage, styles, trustPage } from "./pages";
 
 export interface Env {
   DB: D1Database;
@@ -92,14 +92,46 @@ export interface Listing {
   security: Security | null;
   listed_at: number;
   checked_at: number;
+  /** Failed checks in a row since the last good one. */
+  fails: number;
   shot_url: string | null;
   shot_at: number;
+  /** Set when a human at the operator reviewed the listing. */
+  endorsed_at: number;
+  endorse_note: string;
+  /** Domain that vouches for the agent's namespace, when verified. */
+  agent_domain: string | null;
+}
+
+export interface Query {
+  q: string;
+  filter: "all" | "endorsed";
+  sort: "new" | "checked";
+  page: number;
+}
+
+export interface AgentSummary {
+  handle: string;
+  name: string | null;
+  sites: number;
+  since: number;
+  domain: string | null;
 }
 
 export interface LogEvent {
   seq: number;
   ts: number;
-  type: "listed" | "checked" | "check_failed" | "delisted" | "removed";
+  type:
+    | "listed"
+    | "checked"
+    | "check_failed"
+    | "delisted"
+    | "removed"
+    | "endorsed"
+    | "unendorsed"
+    | "claimed"
+    | "agent_verified"
+    | "agent_unverified";
   site_id: string;
   url: string | null;
   url_hash: string;
@@ -124,7 +156,11 @@ const LIMITS = {
   verify: { n: 30, windowSec: 3600 },
 } as const;
 const userAgent = (env: Env) => `agentwork-verifier/1.0 (+${config(env).site}/agents.md)`;
-const LISTING_COLUMNS = "id, url, host, title, description, agent, agent_id, method, security, listed_at, checked_at, shot, shot_at";
+const LISTING_COLUMNS =
+  "id, url, host, title, description, agent, agent_id, method, security, listed_at, checked_at, fails, shot, shot_at, endorsed_at, endorse_note, " +
+  "(SELECT domain FROM agents a WHERE a.handle = sites.agent_id AND a.verified_at > 0) AS agent_domain";
+const AGENT_RECHECK_PER_RUN = 5;
+const AGENTS_FILE = "/.well-known/agentwork-agents.txt";
 
 const enc = new TextEncoder();
 
@@ -145,11 +181,22 @@ export default {
       if (handle) {
         const sites = await listedBy(env, handle.id);
         if (!sites.length) return html(c, notFoundPage(c), 404);
-        return html(c, agentPage(c, handle, sites));
+        return html(c, agentPage(c, handle, sites, await siteEvents(env, handle.id)));
       }
       switch (path) {
-        case "/":
-          return html(c, homePage(c, await listed(env, 200), await countListed(env)));
+        case "/": {
+          const query = parseQuery(url);
+          const found = await searchListed(env, query, PAGE_SIZE);
+          return html(c, homePage(c, query, found.sites, found.total, await countListed(env), await countEndorsed(env)));
+        }
+        case "/agents":
+          return html(c, agentsIndexPage(c, await agentSummaries(env)));
+        case "/trust":
+          return html(c, trustPage(c));
+        case "/random": {
+          const pick = await env.DB.prepare("SELECT id FROM sites WHERE status = 'listed' ORDER BY RANDOM() LIMIT 1").first<{ id: string }>();
+          return new Response(null, { status: 302, headers: { location: pick ? `/site/${pick.id}` : "/", "cache-control": "no-store" } });
+        }
         case "/log":
           return html(c, logPage(c, await recentEvents(env, 100)));
         case "/agents.md":
@@ -182,6 +229,13 @@ export default {
     )
       .bind(now - RECHECK_EVERY_MS, RECHECK_PER_RUN)
       .all<CheckRow>();
+    const agents = await env.DB.prepare("SELECT handle FROM agents WHERE verified_at > 0 AND checked_at < ? ORDER BY checked_at LIMIT ?")
+      .bind(now - RECHECK_EVERY_MS, AGENT_RECHECK_PER_RUN)
+      .all<{ handle: string }>();
+    for (const a of agents.results) {
+      const handle = parseHandle(a.handle);
+      if (handle) await verifyNamespace(env, handle);
+    }
     let shots = 0;
     for (const row of results) {
       const outcome = await recheck(env, row, "schedule");
@@ -212,20 +266,51 @@ async function api(request: Request, env: Env, ctx: ExecutionContext, path: stri
     });
   }
 
+  if (parts[0] === "agents" && parts.length === 1 && request.method === "GET") return json({ agents: await agentSummaries(env) });
+  if (parts[0] === "agents" && parts[1] === "whoami" && parts.length === 2 && request.method === "POST") return whoami(request, env);
+  if (parts[0] === "agents" && parts.length === 3 && parts[2] === "verify" && request.method === "POST") {
+    if (await limited(request, env, "verify")) return apiError(429, "rate_limited", "Too many verification attempts from here. Try again in an hour.");
+    const handle = parseHandle(safeDecode(parts[1]));
+    if (!handle || !(await listedBy(env, handle.id)).length) return apiError(404, "not_found", "No agent profile with this handle. A profile exists once it has a listed site.");
+    const result = await verifyNamespace(env, handle);
+    if (result.verified) return json({ agent: handle.id, namespace_verified: true, domain: result.domain, profile: `${config(env).site}/${handle.id}` });
+    return apiError(
+      422,
+      result.reason === "unreachable" ? "unreachable" : "hash_missing",
+      `To verify the namespace ${handle.vendor}, serve a text file containing ${handle.hash} at one of: ${vendorHosts(handle.vendor).map((h) => `https://${h}${AGENTS_FILE}`).join(" , ")}`,
+    );
+  }
   if (parts[0] === "agents" && parts.length === 2 && request.method === "GET") {
     const handle = parseHandle(safeDecode(parts[1]));
     const sites = handle ? await listedBy(env, handle.id) : [];
     if (!handle || !sites.length) return apiError(404, "not_found", "No agent profile with this handle.");
-    return json({ agent: handle.id, hash: handle.hash, vendor: handle.vendor, vendor_verified: false, profile: `${config(env).site}/${handle.id}`, sites });
+    const domain = sites[0].agent_domain;
+    return json({
+      agent: handle.id,
+      hash: handle.hash,
+      namespace: handle.vendor,
+      namespace_verified: !!domain,
+      ...(domain ? { namespace_domain: domain } : {}),
+      profile: `${config(env).site}/${handle.id}`,
+      sites,
+      events: await siteEvents(env, handle.id),
+    });
   }
 
   if (parts[0] !== "sites") return apiError(404, "not_found", `Unknown endpoint. See ${config(env).site}/agents.md`);
   const id = parts[1];
 
-  if (!id && request.method === "GET") return json({ sites: await listed(env, 500) });
+  if (!id && request.method === "GET") {
+    if (![...url.searchParams.keys()].length) return json({ sites: await listed(env, 500) });
+    const query = parseQuery(url);
+    const found = await searchListed(env, query, 100);
+    return json({ ...found, page: query.page, page_size: 100 });
+  }
   if (!id && request.method === "POST") return register(request, env);
   if (id && parts[2] === "verify" && request.method === "POST") return verify(request, env, ctx, id);
   if (id && parts[2] === "reverify" && request.method === "POST") return reverify(request, env, id);
+  if (id && parts[2] === "claim" && request.method === "POST") return claim(request, env, id);
+  if (id && parts[2] === "endorse" && (request.method === "POST" || request.method === "DELETE")) return endorse(request, env, id);
   if (id && !parts[2] && request.method === "GET") return status(env, id);
   if (id && !parts[2] && request.method === "DELETE") return remove(request, env, id);
   return apiError(405, "method_not_allowed", `Wrong method for this endpoint. See ${config(env).site}/agents.md`);
@@ -240,12 +325,10 @@ async function register(request: Request, env: Env): Promise<Response> {
   if (!target) return apiError(400, "bad_url", "url must be a public https:// address (no IPs, ports or localhost).");
   const agent = cleanAgent(body.agent);
   let agentId = "";
-  if (body.agent_key !== undefined || body.agent_vendor !== undefined) {
-    const vendor = cleanVendor(body.agent_vendor);
-    const key = typeof body.agent_key === "string" ? body.agent_key : "";
-    if (!vendor) return apiError(400, "bad_agent_vendor", "agent_vendor must be a reverse-DNS id like com.anthropic.claude.");
-    if (key.length < 32 || key.length > 200) return apiError(400, "bad_agent_key", "agent_key must be a secret of 32 to 200 characters that you generated and keep private.");
-    agentId = await agentHandle(key, vendor);
+  if (body.agent_key !== undefined || body.agent_vendor !== undefined || body.agent_namespace !== undefined) {
+    const identity = await identityOf(body);
+    if (identity instanceof Response) return identity;
+    agentId = identity;
   }
 
   const existing = await env.DB.prepare("SELECT id FROM sites WHERE url = ? AND status = 'listed'").bind(target.href).first();
@@ -269,7 +352,9 @@ async function register(request: Request, env: Env): Promise<Response> {
       id,
       url: target.href,
       status: "pending",
-      ...(agentId ? { agent_profile: { handle: agentId, url: `${config(env).site}/${agentId}`, note: "Appears once this site is listed." } } : {}),
+      ...(agentId
+        ? { agent_profile: { handle: agentId, url: `${config(env).site}/${agentId}`, note: "Appears once this site is listed. If this handle isn't the one you stored, you used a different key or namespace: stop and fix that first." } }
+        : {}),
       token,
       manage_key: manageKey,
       expires_in_hours: 24,
@@ -377,6 +462,176 @@ async function recheck(env: Env, row: CheckRow, by: "schedule" | "trusted"): Pro
   const detail = `${check.reason} (${row.fails + 1}/${MAX_FAILS})${tag}`;
   await appendLog(env, "check_failed", row.id, row.url, detail);
   return { result: "check_failed", detail };
+}
+
+// ---------- Endorsements ----------
+
+/** Only the operator (ADMIN_TOKEN) can endorse: it means a human looked at the site. Always logged. */
+async function endorse(request: Request, env: Env, id: string): Promise<Response> {
+  const key = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (!env.ADMIN_TOKEN || !key || !safeEqual(key, env.ADMIN_TOKEN)) return apiError(401, "unauthorized", "Only the operator can endorse a site.");
+  const row = await env.DB.prepare("SELECT url, endorsed_at FROM sites WHERE id = ? AND status = 'listed'").bind(id).first<{ url: string; endorsed_at: number }>();
+  if (!row) return apiError(404, "not_found", "No listed site with this id.");
+
+  if (request.method === "DELETE") {
+    if (!row.endorsed_at) return json({ id, endorsed: false });
+    await env.DB.prepare("UPDATE sites SET endorsed_at = 0, endorse_note = '' WHERE id = ?").bind(id).run();
+    await appendLog(env, "unendorsed", id, row.url);
+    return json({ id, endorsed: false });
+  }
+  const body = (await readJson(request)) ?? {};
+  const note = typeof body.note === "string" ? clip(body.note, 160) : "";
+  await env.DB.prepare("UPDATE sites SET endorsed_at = ?, endorse_note = ? WHERE id = ?").bind(Date.now(), note, id).run();
+  await appendLog(env, "endorsed", id, row.url, note);
+  return json({ id, endorsed: true, note });
+}
+
+// ---------- Agent identity ----------
+
+/** Reads agent_key + agent_namespace (or its older name agent_vendor) and returns the handle. */
+async function identityOf(body: Record<string, unknown>): Promise<string | Response> {
+  const namespace = cleanVendor(body.agent_namespace ?? body.agent_vendor);
+  const key = typeof body.agent_key === "string" ? body.agent_key : "";
+  if (!namespace) return apiError(400, "bad_agent_namespace", "agent_namespace must be a reverse-DNS id like com.example.agents or com.anthropic.claude.");
+  if (key.length < 32 || key.length > 200) return apiError(400, "bad_agent_key", "agent_key must be a secret of 32 to 200 characters that you generated and keep private.");
+  return agentHandle(key, namespace);
+}
+
+/** Lets an agent check which profile its key maps to before it lists anything. */
+async function whoami(request: Request, env: Env): Promise<Response> {
+  if (await limited(request, env, "verify")) return apiError(429, "rate_limited", "Too many attempts from here. Try again in an hour.");
+  const body = await readJson(request);
+  if (!body) return apiError(400, "bad_json", 'Send {"agent_key": "…", "agent_namespace": "com.example.agents"}.');
+  const identity = await identityOf(body);
+  if (identity instanceof Response) return identity;
+  const sites = await listedBy(env, identity);
+  return json({
+    agent: identity,
+    profile: `${config(env).site}/${identity}`,
+    sites_listed: sites.length,
+    namespace_verified: !!sites[0]?.agent_domain,
+    note: sites.length ? "This is your existing profile." : "No listed site under this handle yet. If you expected one, you're using a different key or namespace than before.",
+  });
+}
+
+/** Attaches an existing listing to an agent profile. Needs the listing's manage key. */
+async function claim(request: Request, env: Env, id: string): Promise<Response> {
+  const manage = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (!manage) return apiError(401, "unauthorized", "Send Authorization: Bearer <manage_key>.");
+  const row = await env.DB.prepare("SELECT url, status, manage_hash, agent_id FROM sites WHERE id = ?")
+    .bind(id)
+    .first<{ url: string; status: string; manage_hash: string; agent_id: string }>();
+  if (!row) return apiError(404, "not_found", "No site with this id.");
+  if (!safeEqual(await sha256(manage), row.manage_hash)) return apiError(403, "forbidden", "Wrong manage key.");
+  const body = await readJson(request);
+  if (!body) return apiError(400, "bad_json", 'Send {"agent_key": "…", "agent_namespace": "com.example.agents"}.');
+  const identity = await identityOf(body);
+  if (identity instanceof Response) return identity;
+  const name = cleanAgent(body.agent);
+  await env.DB.prepare("UPDATE sites SET agent_id = ?, agent = CASE WHEN ? != '' THEN ? ELSE agent END WHERE id = ?").bind(identity, name, name, id).run();
+  if (row.status === "listed" && row.agent_id !== identity) await appendLog(env, "claimed", id, row.url, `agent=${identity}`);
+  return json({ id, agent: identity, profile: `${config(env).site}/${identity}` });
+}
+
+/** com.example.agents → agents.example.com, then example.com: any of them can vouch for the namespace. */
+function vendorHosts(vendor: string): string[] {
+  const labels = vendor.split(".").reverse();
+  const hosts: string[] = [];
+  for (let i = 0; i <= labels.length - 2; i++) hosts.push(labels.slice(i).join("."));
+  return hosts;
+}
+
+type NamespaceResult = { verified: true; domain: string } | { verified: false; reason: "missing" | "unreachable" };
+
+/**
+ * A namespace is verified when the domain behind it publishes the agent's hash. Updates the
+ * agents table and logs every change of state.
+ */
+async function verifyNamespace(env: Env, handle: Handle): Promise<NamespaceResult> {
+  const now = Date.now();
+  let domain = "";
+  let reachable = false;
+  for (const host of vendorHosts(handle.vendor)) {
+    const file = await fetchCapped(env, new URL(`https://${host}${AGENTS_FILE}`), 16_384);
+    // A 404 still means the domain answered: the file just isn't there.
+    if (!file.ok) {
+      if (file.reason === "http_error") reachable = true;
+      continue;
+    }
+    reachable = true;
+    if (file.body.split(/\s+/).some((line) => line === handle.hash || line === handle.id)) {
+      domain = host;
+      break;
+    }
+  }
+  const before = await env.DB.prepare("SELECT verified_at, fails FROM agents WHERE handle = ?").bind(handle.id).first<{ verified_at: number; fails: number }>();
+  const logUrl = `agent:${handle.id}`;
+
+  if (domain) {
+    await env.DB.prepare(
+      "INSERT INTO agents (handle, domain, verified_at, checked_at, fails) VALUES (?, ?, ?, ?, 0) ON CONFLICT(handle) DO UPDATE SET domain = excluded.domain, verified_at = CASE WHEN agents.verified_at > 0 THEN agents.verified_at ELSE excluded.verified_at END, checked_at = excluded.checked_at, fails = 0",
+    )
+      .bind(handle.id, domain, now, now)
+      .run();
+    if (!before?.verified_at) await appendLog(env, "agent_verified", handle.id, logUrl, `domain=${domain}`);
+    return { verified: true, domain };
+  }
+  if (before?.verified_at) {
+    // The file is there without the hash: unverify now. Unreachable: give it a few tries first.
+    const fails = before.fails + 1;
+    if (reachable || fails >= MAX_FAILS) {
+      await env.DB.prepare("UPDATE agents SET verified_at = 0, checked_at = ?, fails = 0 WHERE handle = ?").bind(now, handle.id).run();
+      await appendLog(env, "agent_unverified", handle.id, logUrl, reachable ? "hash_missing" : `unreachable (${MAX_FAILS} checks in a row)`);
+    } else {
+      await env.DB.prepare("UPDATE agents SET checked_at = ?, fails = ? WHERE handle = ?").bind(now, fails, handle.id).run();
+    }
+  }
+  return { verified: false, reason: reachable ? "missing" : "unreachable" };
+}
+
+async function agentSummaries(env: Env): Promise<AgentSummary[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT agent_id AS handle, COUNT(*) AS sites, MIN(listed_at) AS since,
+       (SELECT agent FROM sites s2 WHERE s2.agent_id = sites.agent_id AND s2.status = 'listed' AND s2.agent != '' GROUP BY agent ORDER BY COUNT(*) DESC, MAX(listed_at) DESC LIMIT 1) AS name,
+       (SELECT domain FROM agents a WHERE a.handle = sites.agent_id AND a.verified_at > 0) AS domain
+     FROM sites WHERE status = 'listed' AND agent_id != '' GROUP BY agent_id ORDER BY sites DESC, since LIMIT 200`,
+  ).all<AgentSummary>();
+  return results;
+}
+
+// ---------- Search ----------
+
+function parseQuery(url: URL): Query {
+  const p = url.searchParams;
+  return {
+    q: (p.get("q") ?? "").replace(/\s+/g, " ").trim().slice(0, 60),
+    filter: p.get("filter") === "endorsed" ? "endorsed" : "all",
+    sort: p.get("sort") === "checked" ? "checked" : "new",
+    page: Math.min(500, Math.max(1, Number.parseInt(p.get("page") ?? "1", 10) || 1)),
+  };
+}
+
+async function searchListed(env: Env, query: Query, pageSize: number): Promise<{ sites: Listing[]; total: number }> {
+  const where = ["status = 'listed'"];
+  const binds: (string | number)[] = [];
+  if (query.q) {
+    const like = `%${query.q.replace(/[\\%_]/g, "\\$&")}%`;
+    where.push("(title LIKE ? ESCAPE '\\' OR host LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' OR agent LIKE ? ESCAPE '\\')");
+    binds.push(like, like, like, like);
+  }
+  if (query.filter === "endorsed") where.push("endorsed_at > 0");
+  const clause = where.join(" AND ");
+  const order = query.sort === "checked" ? "checked_at DESC" : "listed_at DESC";
+  const total = await env.DB.prepare(`SELECT COUNT(*) AS n FROM sites WHERE ${clause}`).bind(...binds).first<{ n: number }>();
+  const { results } = await env.DB.prepare(`SELECT ${LISTING_COLUMNS} FROM sites WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`)
+    .bind(...binds, pageSize, (query.page - 1) * pageSize)
+    .all<ListingRow>();
+  return { sites: results.map((r) => toListing(env, r)), total: total?.n ?? 0 };
+}
+
+async function countEndorsed(env: Env): Promise<number> {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM sites WHERE status = 'listed' AND endorsed_at > 0").first<{ n: number }>();
+  return row?.n ?? 0;
 }
 
 // ---------- Screenshots ----------
@@ -794,7 +1049,7 @@ function html(c: Config, body: string, status = 200): Response {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
       "content-security-policy":
-        `default-src 'none'; style-src 'self'; img-src 'self' ${c.imgOrigin}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+        `default-src 'none'; style-src 'self'; img-src 'self' ${c.imgOrigin}; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,
     },
   });
 }
