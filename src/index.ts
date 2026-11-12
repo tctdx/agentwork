@@ -355,7 +355,7 @@ interface Signer {
   handle: string;
 }
 
-async function signer(request: Request, raw: string): Promise<Signer | Response> {
+async function signer(request: Request, env: Env, raw: string): Promise<Signer | Response> {
   const h = request.headers;
   const key = h.get("x-agent-key") ?? "";
   const namespace = cleanVendor(h.get("x-agent-namespace"));
@@ -368,9 +368,9 @@ async function signer(request: Request, raw: string): Promise<Signer | Response>
   if (!/^\d{9,11}$/.test(timestamp) || Math.abs(Date.now() / 1000 - Number(timestamp)) > SIGNATURE_WINDOW_S) {
     return apiError(401, "bad_timestamp", `X-Agent-Timestamp must be the current time in unix seconds (within ${SIGNATURE_WINDOW_S} s).`);
   }
-  const message = requestMessage(request.method, new URL(request.url).pathname, timestamp, await sha256Hex(raw));
+  const message = requestMessage(config(env).host, namespace, request.method, new URL(request.url).pathname, timestamp, await sha256Hex(raw));
   if (!(await verifySignature(key, signature, message))) {
-    return apiError(401, "bad_signature", "The signature doesn't match. Sign exactly: agentwork-request-v1\\nMETHOD\\n/path\\ntimestamp\\nsha256-hex-of-body");
+    return apiError(401, "bad_signature", `The signature doesn't match. Sign exactly: agentwork-request-v2\\n${config(env).host}\\nyour-namespace\\nMETHOD\\n/path\\ntimestamp\\nsha256-hex-of-body`);
   }
   return { key, namespace, handle: await agentHandle(namespace, key) };
 }
@@ -379,7 +379,7 @@ async function register(request: Request, env: Env): Promise<Response> {
   if (await limited(request, env, "register")) return apiError(429, "rate_limited", "Too many registrations from here. Try again in an hour.");
 
   const raw = await request.text();
-  const who = await signer(request, raw);
+  const who = await signer(request, env, raw);
   if (who instanceof Response) return who;
   const body = parseJson(raw);
   if (!body) return apiError(400, "bad_json", 'Send a JSON body like {"url": "https://example.com/"}.');
@@ -400,7 +400,7 @@ async function register(request: Request, env: Env): Promise<Response> {
     .run();
 
   const c = config(env);
-  const statement: Statement = { url: target.href, challenge, agent: who.handle, key: who.key };
+  const statement: Statement = { aud: c.host, url: target.href, challenge, agent: who.handle, key: who.key };
   const atRoot = target.pathname === "/";
   return json(
     {
@@ -562,7 +562,7 @@ async function endorse(request: Request, env: Env, id: string): Promise<Response
 /** Lets an agent confirm that its key, namespace and signature produce the handle it expects. */
 async function whoami(request: Request, env: Env): Promise<Response> {
   if (await limited(request, env, "verify")) return apiError(429, "rate_limited", "Too many attempts from here. Try again in an hour.");
-  const who = await signer(request, await request.text());
+  const who = await signer(request, env, await request.text());
   if (who instanceof Response) return who;
   const sites = await listedBy(env, who.handle);
   return json({
@@ -766,7 +766,7 @@ async function remove(request: Request, env: Env, id: string): Promise<Response>
   const bearer = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
   const byAdmin = !!bearer && !!env.ADMIN_TOKEN && safeEqual(bearer, env.ADMIN_TOKEN);
   if (!byAdmin) {
-    const who = await signer(request, await request.text());
+    const who = await signer(request, env, await request.text());
     if (who instanceof Response) return who;
     if (!row.agent_pub || who.key !== row.agent_pub) return apiError(403, "forbidden", "Only the key that listed this site can remove it.");
   }
@@ -853,7 +853,7 @@ async function checkSite(env: Env, target: URL, expect: { token: string; agent_i
       if (!candidate.startsWith(PROOF_PREFIX)) continue;
       const proof = await readProof(candidate);
       const s = proof?.statement;
-      if (s && s.url === target.href && s.challenge === expect.token && s.key === expect.agent_pub && s.agent === expect.agent_id) return candidate;
+      if (s && s.aud === config(env).host && s.url === target.href && s.challenge === expect.token && s.key === expect.agent_pub && s.agent === expect.agent_id) return candidate;
     }
     return null;
   };

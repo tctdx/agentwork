@@ -2,7 +2,7 @@
  * Signatures used across agentwork. Everything is Ed25519 and every signed message starts with a
  * versioned label, so a signature made for one purpose can never be replayed for another.
  *
- *   agent → request     agentwork-request-v1\n<METHOD>\n<path>\n<unix seconds>\n<sha256 hex of the body>
+ *   agent → request     agentwork-request-v2\n<directory host>\n<namespace>\n<METHOD>\n<path>\n<unix seconds>\n<sha256 hex of the body>
  *   agent → site proof  aw1.<base64url(JSON statement)>            (the token is that + "." + signature)
  *   operator → receipt  agentwork-receipt-v1\n<id>\n<url>\n<agent handle>\n<listed_at ms>
  *   operator → log head agentwork-log-head-v1\n<seq>\n<hash>\n<ts ms>
@@ -59,13 +59,20 @@ export async function agentHandle(namespace: string, publicKey: string): Promise
   return `${(await sha256Hex(`agentwork-agent-v2\n${namespace}\n${publicKey}`)).slice(0, HANDLE_HASH_LENGTH)}@${namespace}`;
 }
 
-export const requestMessage = (method: string, path: string, timestamp: string, bodyHash: string) =>
-  `agentwork-request-v1\n${method.toUpperCase()}\n${path}\n${timestamp}\n${bodyHash}`;
+/**
+ * What an agent signs for each request. It names the directory it's meant for and the namespace
+ * the agent is using, so a captured request can't be replayed on another instance of this code
+ * or under another namespace.
+ */
+export const requestMessage = (host: string, namespace: string, method: string, path: string, timestamp: string, bodyHash: string) =>
+  `agentwork-request-v2\n${host}\n${namespace}\n${method.toUpperCase()}\n${path}\n${timestamp}\n${bodyHash}`;
 
 // ---------- Site proofs ----------
 
 /** What a site publishes: "this address is listed on agentwork by this key, for this challenge". */
 export interface Statement {
+  /** The directory this proof is for (its host), so it means nothing to another instance. */
+  aud: string;
   url: string;
   challenge: string;
   agent: string;
@@ -76,7 +83,7 @@ export const PROOF_PREFIX = "aw1.";
 
 /** The exact text the agent signs: "aw1." + base64url of the statement as JSON. */
 export const proofToSign = (s: Statement) =>
-  PROOF_PREFIX + b64urlEncode(enc.encode(JSON.stringify({ url: s.url, challenge: s.challenge, agent: s.agent, key: s.key })));
+  PROOF_PREFIX + b64urlEncode(enc.encode(JSON.stringify({ aud: s.aud, url: s.url, challenge: s.challenge, agent: s.agent, key: s.key })));
 
 export interface Proof {
   token: string;
@@ -96,9 +103,9 @@ export async function readProof(token: string): Promise<Proof | null> {
   } catch {
     return null;
   }
-  if (!s || typeof s.url !== "string" || typeof s.challenge !== "string" || typeof s.agent !== "string" || !isPublicKey(s.key)) return null;
+  if (!s || typeof s.aud !== "string" || typeof s.url !== "string" || typeof s.challenge !== "string" || typeof s.agent !== "string" || !isPublicKey(s.key)) return null;
   if (!(await verifySignature(s.key, parts[2], `${parts[0]}.${parts[1]}`))) return null;
-  return { token, statement: { url: s.url, challenge: s.challenge, agent: s.agent, key: s.key } };
+  return { token, statement: { aud: s.aud, url: s.url, challenge: s.challenge, agent: s.agent, key: s.key } };
 }
 
 // ---------- Operator ----------

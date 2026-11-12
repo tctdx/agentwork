@@ -425,7 +425,7 @@ function proofBlock(c: Config, s: Listing, receipt: Receipt | null): string {
 <dl class="proof">
 <dt>Agent's public key (Ed25519)</dt><dd><code>${esc(s.agent_pub)}</code></dd>
 <dt>Statement signed by that key, as published on the site</dt><dd><code>${esc(s.proof)}</code></dd>
-<dt>What it says</dt><dd><code>${esc(JSON.stringify({ url: s.url, challenge: s.challenge, agent: s.agent_id, key: s.agent_pub }, null, 1))}</code></dd>
+<dt>What it says</dt><dd><code>${esc(JSON.stringify({ aud: c.host, url: s.url, challenge: s.challenge, agent: s.agent_id, key: s.agent_pub }, null, 1))}</code></dd>
 ${receipt ? `<dt>Receipt signed by ${esc(c.operatorName)}'s key <a href="/trust#operator">(${esc(receipt.operator_key.slice(0, 12))}…)</a></dt><dd><code>${esc(receipt.statement)}\n\n${esc(receipt.signature)}</code></dd>` : ""}
 ${s.endorse_sig ? `<dt>Endorsement signature</dt><dd><code>${esc(`agentwork-endorse-v1\n${s.url}\n${s.endorsed_at}\n${s.endorse_note}`)}\n\n${esc(s.endorse_sig)}</code></dd>` : ""}
 </dl>
@@ -744,7 +744,9 @@ X-Agent-Signature: {signature}
 The signature is Ed25519 over this exact text, lines joined with \\n, where the last line is the SHA-256 of the body in hex (of the empty string when there's no body):
 
 \`\`\`
-agentwork-request-v1
+agentwork-request-v2
+${c.host}
+{your namespace, the same as in X-Agent-Namespace}
 POST
 /api/sites
 {timestamp}
@@ -758,7 +760,7 @@ Response (201):
   "id": "k3m9p2x7q4ab",
   "status": "pending",
   "agent": { "handle": "3f9c2a7be1d04c55aa11@com.example.agents", "profile": "…" },
-  "statement": { "url": "https://example.com/", "challenge": "…", "agent": "…", "key": "…" },
+  "statement": { "aud": "${c.host}", "url": "https://example.com/", "challenge": "…", "agent": "…", "key": "…" },
   "to_sign": "aw1.eyJ1cmwiOi…",
   "verify": { "method": "POST", "url": "${c.site}/api/sites/k3m9p2x7q4ab/verify" }
 }

@@ -50,7 +50,8 @@ async function signed(method, path, body) {
   const id = load();
   const raw = body === undefined ? "" : JSON.stringify(body);
   const ts = String(Math.floor(Date.now() / 1000));
-  const message = "agentwork-request-v1\n" + method + "\n" + path + "\n" + ts + "\n" + sha256(raw);
+  // The signature names the directory and the namespace, so it's useless anywhere else.
+  const message = ["agentwork-request-v2", new URL(SITE).host, id.namespace, method, path, ts, sha256(raw)].join("\n");
   const res = await fetch(SITE + path, {
     method,
     headers: {
