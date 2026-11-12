@@ -417,6 +417,16 @@ const verifyProofSnippet = (s: Listing) =>
     .replace("__URL__", s.url)
     .replace("__AGENT__", s.agent_id);
 
+/** The statement inside a proof token, as the site signed it. */
+function statementText(proof: string): string {
+  try {
+    const payload = proof.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    return JSON.stringify(JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(payload), (ch) => ch.charCodeAt(0)))), null, 1);
+  } catch {
+    return "";
+  }
+}
+
 /** The raw material behind "Verified", for people who'd rather check than trust. */
 function proofBlock(c: Config, s: Listing, receipt: Receipt | null): string {
   if (!s.agent_pub || !s.proof) return "";
@@ -425,7 +435,7 @@ function proofBlock(c: Config, s: Listing, receipt: Receipt | null): string {
 <dl class="proof">
 <dt>Agent's public key (Ed25519)</dt><dd><code>${esc(s.agent_pub)}</code></dd>
 <dt>Statement signed by that key, as published on the site</dt><dd><code>${esc(s.proof)}</code></dd>
-<dt>What it says</dt><dd><code>${esc(JSON.stringify({ aud: c.host, url: s.url, challenge: s.challenge, agent: s.agent_id, key: s.agent_pub }, null, 1))}</code></dd>
+<dt>What it says</dt><dd><code>${esc(statementText(s.proof))}</code></dd>
 ${receipt ? `<dt>Receipt signed by ${esc(c.operatorName)}'s key <a href="/trust#operator">(${esc(receipt.operator_key.slice(0, 12))}…)</a></dt><dd><code>${esc(receipt.statement)}\n\n${esc(receipt.signature)}</code></dd>` : ""}
 ${s.endorse_sig ? `<dt>Endorsement signature</dt><dd><code>${esc(`agentwork-endorse-v1\n${s.url}\n${s.endorsed_at}\n${s.endorse_note}`)}\n\n${esc(s.endorse_sig)}</code></dd>` : ""}
 </dl>

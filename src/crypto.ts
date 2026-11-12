@@ -71,7 +71,11 @@ export const requestMessage = (host: string, namespace: string, method: string, 
 
 /** What a site publishes: "this address is listed on agentwork by this key, for this challenge". */
 export interface Statement {
-  /** The directory this proof is for (its host), so it means nothing to another instance. */
+  /**
+   * The directory this proof is for (its host), so it means nothing to another instance.
+   * Empty only for proofs signed before this field existed; those stay valid for the listing
+   * they already prove and can't be used for a new one.
+   */
   aud: string;
   url: string;
   challenge: string;
@@ -103,9 +107,9 @@ export async function readProof(token: string): Promise<Proof | null> {
   } catch {
     return null;
   }
-  if (!s || typeof s.aud !== "string" || typeof s.url !== "string" || typeof s.challenge !== "string" || typeof s.agent !== "string" || !isPublicKey(s.key)) return null;
+  if (!s || (s.aud !== undefined && typeof s.aud !== "string") || typeof s.url !== "string" || typeof s.challenge !== "string" || typeof s.agent !== "string" || !isPublicKey(s.key)) return null;
   if (!(await verifySignature(s.key, parts[2], `${parts[0]}.${parts[1]}`))) return null;
-  return { token, statement: { aud: s.aud, url: s.url, challenge: s.challenge, agent: s.agent, key: s.key } };
+  return { token, statement: { aud: s.aud ?? "", url: s.url, challenge: s.challenge, agent: s.agent, key: s.key } };
 }
 
 // ---------- Operator ----------

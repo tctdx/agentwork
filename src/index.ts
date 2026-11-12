@@ -500,8 +500,8 @@ async function reverify(request: Request, env: Env, id: string): Promise<Respons
   });
 }
 
-const CHECK_COLUMNS = "id, url, token, agent_id, agent_pub, fails, shot, shot_at";
-type CheckRow = { id: string; url: string; token: string; agent_id: string; agent_pub: string; fails: number; shot: string; shot_at: number };
+const CHECK_COLUMNS = "id, url, token, agent_id, agent_pub, proof, fails, shot, shot_at";
+type CheckRow = { id: string; url: string; token: string; agent_id: string; agent_pub: string; proof: string; fails: number; shot: string; shot_at: number };
 type Outcome =
   | { result: "checked"; detail: string; security: Security }
   | { result: "check_failed" | "delisted"; detail: string };
@@ -838,7 +838,7 @@ type Check =
  * statement naming this address, this challenge and this agent, signed by that agent's key.
  * Listings made before signatures (no key) still match on their plain token until re-proven.
  */
-async function checkSite(env: Env, target: URL, expect: { token: string; agent_id: string; agent_pub: string }): Promise<Check> {
+async function checkSite(env: Env, target: URL, expect: { token: string; agent_id: string; agent_pub: string; proof: string }): Promise<Check> {
   const page = await fetchCapped(env, target);
   if (!page.ok) return page;
   if (!/html/i.test(page.type)) return { ok: false, reason: "not_html", message: `${target.href} didn't return an HTML page.` };
@@ -853,7 +853,10 @@ async function checkSite(env: Env, target: URL, expect: { token: string; agent_i
       if (!candidate.startsWith(PROOF_PREFIX)) continue;
       const proof = await readProof(candidate);
       const s = proof?.statement;
-      if (s && s.aud === config(env).host && s.url === target.href && s.challenge === expect.token && s.key === expect.agent_pub && s.agent === expect.agent_id) return candidate;
+      if (!s || s.url !== target.href || s.challenge !== expect.token || s.key !== expect.agent_pub || s.agent !== expect.agent_id) continue;
+      // The proof must name this directory. One signed before that field existed is accepted only
+      // as the exact proof this listing already has, never for a new registration.
+      if (s.aud === config(env).host || (s.aud === "" && !!expect.proof && candidate === expect.proof)) return candidate;
     }
     return null;
   };
