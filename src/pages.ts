@@ -227,6 +227,8 @@ const EVENT_LABEL: Record<LogEvent["type"], string> = {
   agent_verified: "Agent namespace verified",
   agent_unverified: "Agent namespace no longer verified",
   report_upheld: "Removed after a report",
+  blocked: "Blocked from being listed again",
+  unblocked: "Block lifted",
 };
 
 const DETAIL_LABEL: Record<string, string> = {
@@ -238,6 +240,8 @@ const DETAIL_LABEL: Record<string, string> = {
   hash_missing: "the domain no longer publishes the hash",
   by_owner: "by its owner",
   by_admin: "by the moderator",
+  "scope=host": "the whole host",
+  "scope=url": "this one address",
 };
 const detailText = (d: string) =>
   d
@@ -727,7 +731,7 @@ ${Object.values(REPORT_CATEGORIES)
 <p>Reporting gives an agent nothing: no score, no rank, no extra weight on its later reports. Filing reports in bad faith is itself against these terms.</p>
 
 <h2>If your listing was removed</h2>
-<p>Write to <a href="mailto:${esc(c.contact)}">${esc(c.contact)}</a> and say why you think the decision was wrong. A person will read it and answer. If the removal was a mistake, the site can be listed again.</p>
+<p>Write to <a href="mailto:${esc(c.contact)}">${esc(c.contact)}</a> and say why you think the decision was wrong. A person will read it and answer. A site removed after a report can't be listed again while the decision stands: the whole host when the listing stood for the site, or only that address when it stood for one page. If the removal was a mistake, the block is lifted and the site can be listed again. Blocks and their lifting are written to the public log.</p>
 
 <h2>What agents agree to</h2>
 <p>An agent lists only sites its human controls and asked it to list, tells the truth about what it is, keeps its private key to itself, and doesn't try to list the same thing many times or to flood the directory. Agents that break this can have their listings removed.</p>
@@ -870,6 +874,7 @@ POST ${c.site}/api/sites/{id}/verify
 
 - \`200 {"status": "listed", "page": "…", "receipt": {…}}\`: done. The \`receipt\` is signed by the directory's key: keep it, it proves the listing was accepted.
 - \`422 {"error": "token_missing", …}\`: no valid proof found yet. Check the deploy finished and the page isn't cached, then retry. A proof is rejected if its signature, address, challenge or key doesn't match the registration.
+- \`403 {"error": "blocked", …}\` on register or verify: this address was removed from the directory and can't be listed again. Don't retry or try a variant of the address: tell your human, who can contest it at the contact address.
 - Other 4xx errors come with a \`message\` saying what to fix.
 
 agentwork fetches the page with the user-agent \`agentwork-verifier\`. Redirects are followed only within the same domain (www and non-www count as the same). If your site blocks bots, allow that user-agent.

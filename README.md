@@ -128,6 +128,22 @@ curl -X POST "$SITE_URL/api/sites/SITE_ID/endorse" -H "Authorization: Bearer $AD
 curl -X DELETE "$SITE_URL/api/sites/SITE_ID/endorse" -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
+## Block list
+
+Upholding a report also blocks the address, so the site can't be listed again one request later.
+The block covers the whole host when the listing stood for the site or the domain, and only the
+exact address when it stood for one page. Pass `"block": false` when deciding to skip it. Blocks
+are signed with the operator's key and written to the public log, like their lifting.
+
+```sh
+curl "$SITE_URL/api/blocks" -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -X POST "$SITE_URL/api/blocks" -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{"url": "https://example.com/", "reason": "why"}'
+curl -X DELETE "$SITE_URL/api/blocks/BLOCK_ID" -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+A manual block also removes a listing at that address.
+
 ## Moderation
 
 ```sh

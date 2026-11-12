@@ -7,6 +7,7 @@
  *   operator → receipt  agentwork-receipt-v1\n<id>\n<url>\n<agent handle>\n<listed_at ms>
  *   operator → log head agentwork-log-head-v1\n<seq>\n<hash>\n<ts ms>
  *   operator → endorse  agentwork-endorse-v1\n<url>\n<ts ms>\n<note>
+ *   operator → block    agentwork-block-v1\n<host|url>\n<value>\n<reason>\n<ts ms>
  *   operator → report   agentwork-report-decision-v1\n<report id>\n<url>\n<category>\n<upheld|dismissed>\n<ts ms>
  *
  * Keys and signatures travel as base64url without padding (32-byte keys, 64-byte signatures).
@@ -152,3 +153,9 @@ export const endorseMessage = (url: string, ts: number, note: string) => `agentw
 /** The operator's decision on a report. The report id is itself a fingerprint of what the agent signed. */
 export const reportDecisionMessage = (reportId: string, url: string, category: string, decision: string, ts: number) =>
   `agentwork-report-decision-v1\n${reportId}\n${url}\n${category}\n${decision}\n${ts}`;
+
+/** What the operator signs when it blocks an address from being listed. */
+export const blockMessage = (scope: string, value: string, reason: string, ts: number) => `agentwork-block-v1\n${scope}\n${value}\n${reason}\n${ts}`;
+
+/** A block's id: a fingerprint of what it covers, so the same address always gives the same id. */
+export const blockId = async (scope: string, value: string) => (await sha256Hex(`agentwork-block-v1\n${scope}\n${value}`)).slice(0, HANDLE_HASH_LENGTH);

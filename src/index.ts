@@ -38,6 +38,8 @@ import {
   readProof,
   receiptMessage,
   reportDecisionMessage,
+  blockId,
+  blockMessage,
   requestMessage,
   sha256Hex,
   verifySignature,
@@ -46,6 +48,7 @@ import {
 import { GENESIS, MAX_FAILS, PAGE_SIZE, RECHECK_EVERY_MS, sitePath } from "./constants";
 import { DNS_LABEL, lookupTxt } from "./dns";
 import { agentPage, agentsIndexPage, agentsMd, homePage, logPage, notFoundPage, privacyPage, sitePage, styles, termsPage, trustPage } from "./pages";
+import { addBlock, blockFor, blockTarget, listBlocks, removeBlock, type Block } from "./blocks";
 import { decideReport, fileReport, getReport, REPORT_CATEGORIES, reportForReporter, reportQueue, reportTotals, type Report } from "./reports";
 
 export interface Env {
@@ -164,7 +167,9 @@ export interface LogEvent {
     | "claimed"
     | "agent_verified"
     | "agent_unverified"
-    | "report_upheld";
+    | "report_upheld"
+    | "blocked"
+    | "unblocked";
   site_id: string;
   url: string | null;
   url_hash: string;
@@ -346,6 +351,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext, path: stri
   }
 
   if (parts[0] === "reports") return reports(request, env, parts, url);
+  if (parts[0] === "blocks") return blocks(request, env, parts);
 
   if (parts[0] !== "sites") return apiError(404, "not_found", `Unknown endpoint. See ${config(env).site}/agents.md`);
   const id = parts[1];
@@ -404,6 +410,8 @@ async function register(request: Request, env: Env): Promise<Response> {
   const target = normalizeUrl(body.url);
   if (!target) return apiError(400, "bad_url", "url must be a public https:// address (no IPs, ports or localhost).");
   const agent = cleanAgent(body.agent);
+  const refused = await refuseIfBlocked(env, target);
+  if (refused) return refused;
 
   const pending = await env.DB.prepare("SELECT COUNT(*) AS n FROM sites WHERE status = 'pending'").first<{ n: number }>();
   if ((pending?.n ?? 0) >= MAX_PENDING) return apiError(503, "busy", "Too many pending registrations right now. Try again later.");
@@ -453,6 +461,8 @@ async function verify(request: Request, env: Env, ctx: ExecutionContext, id: str
   const row = await env.DB.prepare(`SELECT ${CHECK_COLUMNS}, status FROM sites WHERE id = ?`).bind(id).first<CheckRow & { status: string }>();
   if (!row) return apiError(404, "not_found", "No registration with this id. Pending ones expire after 24 hours.");
   if (row.status === "listed") return json({ id, status: "listed", url: row.url, page: c.site + sitePath({ id, agent_id: row.agent_id }) });
+  const refused = await refuseIfBlocked(env, new URL(row.url));
+  if (refused) return refused;
 
   const check = await checkSite(env, new URL(row.url), row);
   if (!check.ok) return apiError(422, check.reason, check.message);
@@ -582,6 +592,68 @@ async function endorse(request: Request, env: Env, id: string): Promise<Response
   return json({ id, endorsed: true, note, statement: endorseMessage(row.url, ts, note), signature, operator_key: op.publicKey });
 }
 
+// ---------- Block list ----------
+// The rules live in blocks.ts. A block is signed by the operator and written to the public log.
+
+async function refuseIfBlocked(env: Env, target: URL): Promise<Response | null> {
+  const found = await blockFor(env.DB, target);
+  if (!found) return null;
+  const what = found.scope === "host" ? `${found.value} was` : "This address was";
+  return apiError(403, "blocked", `${what} removed from the directory and can't be listed again. To contest it, write to ${config(env).contact}. Terms: ${config(env).site}/terms`);
+}
+
+async function block(env: Env, op: { sign(message: string): Promise<string> }, target: Pick<Block, "scope" | "value">, reason: string, reportId: string, logUrl: string): Promise<Block | null> {
+  const ts = Date.now();
+  const entry: Block = {
+    id: await blockId(target.scope, target.value),
+    ...target,
+    reason,
+    report_id: reportId,
+    created_at: ts,
+    sig: await op.sign(blockMessage(target.scope, target.value, reason, ts)),
+  };
+  if (!(await addBlock(env.DB, entry))) return null; // already blocked
+  await appendLog(env, "blocked", entry.id, logUrl, `scope=${entry.scope}; ${reason}${reportId ? `; report=${reportId}` : ""}`);
+  return entry;
+}
+
+/** The operator's view of the block list, a manual block, and lifting one. */
+async function blocks(request: Request, env: Env, parts: string[]): Promise<Response> {
+  if (!isAdmin(request, env)) return apiError(401, "unauthorized", "Only the operator can read or change the block list.");
+  if (parts.length === 1 && request.method === "GET") return json({ blocks: await listBlocks(env.DB) });
+
+  if (parts.length === 1 && request.method === "POST") {
+    const body = (await readJson(request)) ?? {};
+    const target = normalizeUrl(body.url);
+    if (!target) return apiError(400, "bad_url", "url must be a public https:// address.");
+    const op = await operatorOrNull(env);
+    if (!op) return apiError(503, "no_operator_key", "The operator key is unavailable, so the block can't be signed. Nothing was changed.");
+    // A manual block covers the host for a root address, and the exact address otherwise.
+    const reason = typeof body.reason === "string" ? clip(body.reason, 120).replace(/;/g, ",") : "";
+    const made = await block(env, op, blockTarget(target.href, "file"), reason || "by_admin", "", target.href);
+    if (!made) return apiError(409, "already_blocked", "This address is already blocked.");
+    // A listing at a blocked address goes too.
+    const listed = await env.DB.prepare("SELECT id, url, shot FROM sites WHERE status = 'listed'").all<{ id: string; url: string; shot: string }>();
+    let removed = 0;
+    for (const site of listed.results) {
+      if (!(await blockFor(env.DB, new URL(site.url)))) continue;
+      await env.DB.prepare("DELETE FROM sites WHERE id = ?").bind(site.id).run();
+      await dropShot(env, site.shot);
+      await appendLog(env, "removed", site.id, site.url, "by_admin");
+      removed++;
+    }
+    return json({ ...made, listings_removed: removed }, 201);
+  }
+
+  if (parts.length === 2 && request.method === "DELETE") {
+    const lifted = await removeBlock(env.DB, parts[1]);
+    if (!lifted) return apiError(404, "not_found", "No block with this id.");
+    await appendLog(env, "unblocked", lifted.id, lifted.scope === "url" ? lifted.value : `https://${lifted.value}/`, `scope=${lifted.scope}`);
+    return json({ id: lifted.id, lifted: true, scope: lifted.scope, value: lifted.value });
+  }
+  return apiError(405, "method_not_allowed", `Wrong method for this endpoint. See ${config(env).site}/agents.md`);
+}
+
 // ---------- Reports ----------
 // The rules live in reports.ts. Here: who is asking (a signature or the admin token), then the call.
 
@@ -656,19 +728,25 @@ async function reports(request: Request, env: Env, parts: string[], url: URL): P
     const r = decided.report;
 
     let removed = false;
+    let blocked: Block | null = null;
     if (decision === "upheld") {
-      const site = await env.DB.prepare("SELECT url, shot FROM sites WHERE id = ? AND status = 'listed'").bind(r.site_id).first<{ url: string; shot: string }>();
+      const site = await env.DB.prepare("SELECT url, shot, method FROM sites WHERE id = ? AND status = 'listed'")
+        .bind(r.site_id)
+        .first<{ url: string; shot: string; method: string }>();
       if (site) {
         await env.DB.prepare("DELETE FROM sites WHERE id = ?").bind(r.site_id).run();
         await dropShot(env, site.shot);
         await appendLog(env, "report_upheld", r.site_id, site.url, `category=${r.category}; report=${r.id}`);
         removed = true;
+        // Without a block, the removed site is one signed request away from being listed again.
+        if (body.block !== false) blocked = await block(env, op, blockTarget(site.url, site.method), `category=${r.category}`, r.id, site.url);
       }
     }
     return json({
       id: r.id,
       status: r.status,
       listing_removed: removed,
+      ...(blocked ? { blocked: { id: blocked.id, scope: blocked.scope, value: blocked.value, lift: `DELETE ${c.site}/api/blocks/${blocked.id}` } } : {}),
       also_closed: decided.alsoClosed,
       statement: reportDecisionMessage(r.id, r.url, r.category, decision, r.decided_at),
       signature: r.decision_sig,
