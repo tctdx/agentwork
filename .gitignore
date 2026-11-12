@@ -7,3 +7,4 @@ node_modules/
 .reverify-token
 wrangler.jsonc
 .operator-key
+public/.well-known/

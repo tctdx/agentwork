@@ -410,16 +410,12 @@ ${site}
 
 const fact = (label: string, value: string) => `<div class="fact"><dt>${label}</dt><dd>${value}</dd></div>`;
 
-const verifyProofSnippet = (s: Listing) => `// Fetch the proof from the site itself and check it. Nothing here asks agentwork.
-const where = ${JSON.stringify(s.method === "file" ? new URL("/.well-known/agentwork.txt", s.url).href : s.url)};
-const text = await fetch(where).then((r) => r.text());
-const token = text.match(/aw1\\.[\\w-]+\\.[\\w-]+/)[0];
-const [v, payload, sig] = token.split(".");
-const b64 = (x) => Uint8Array.from(atob(x.replace(/-/g, "+").replace(/_/g, "/")), (ch) => ch.charCodeAt(0));
-const statement = JSON.parse(new TextDecoder().decode(b64(payload)));
-const key = await crypto.subtle.importKey("raw", b64(statement.key), { name: "Ed25519" }, false, ["verify"]);
-const ok = await crypto.subtle.verify({ name: "Ed25519" }, key, b64(sig), new TextEncoder().encode(v + "." + payload));
-console.log(ok, statement); // true, and the statement should name ${s.url} and ${s.agent_id}`;
+/** Bash, so it can be read and run anywhere: curl fetches the proof, openssl checks the signature. */
+const PROOF_SH = "# Fetch the proof from the site itself and check it. Nothing here asks agentwork.\n# Needs curl and OpenSSL 3 or newer (macOS's built-in openssl is too old: use Homebrew's).\nwhere=\"__WHERE__\"\ntoken=$(curl -s \"$where\" | grep -o 'aw1\\.[A-Za-z0-9_-]*\\.[A-Za-z0-9_-]*' | head -1)\nIFS=. read -r v payload sig <<< \"$token\"\nb64d() { local s; s=$(printf %s \"$1\" | tr '_-' '/+'); while [ $((${#s} % 4)) -ne 0 ]; do s=\"$s=\"; done; printf %s \"$s\" | openssl base64 -d -A; }\ntmp=$(mktemp -d)\nstatement=$(b64d \"$payload\")\nkey=$(printf %s \"$statement\" | sed -E 's/.*\"key\":\"([^\"]+)\".*/\\1/')\n{ printf '\\x30\\x2a\\x30\\x05\\x06\\x03\\x2b\\x65\\x70\\x03\\x21\\x00'; b64d \"$key\"; } | openssl pkey -pubin -inform DER -out \"$tmp/key.pem\"\nb64d \"$sig\" > \"$tmp/sig\"\nprintf %s \"$v.$payload\" > \"$tmp/msg\"\necho \"$statement\"\nopenssl pkeyutl -verify -pubin -inkey \"$tmp/key.pem\" -rawin -in \"$tmp/msg\" -sigfile \"$tmp/sig\"\n# \"Signature Verified Successfully\", and the statement should name __URL__ and __AGENT__";
+const verifyProofSnippet = (s: Listing) =>
+  PROOF_SH.replace("__WHERE__", s.method === "file" ? new URL("/.well-known/agentwork.txt", s.url).href : s.url)
+    .replace("__URL__", s.url)
+    .replace("__AGENT__", s.agent_id);
 
 /** The raw material behind "Verified", for people who'd rather check than trust. */
 function proofBlock(c: Config, s: Listing, receipt: Receipt | null): string {
@@ -433,7 +429,7 @@ function proofBlock(c: Config, s: Listing, receipt: Receipt | null): string {
 ${receipt ? `<dt>Receipt signed by ${esc(c.operatorName)}'s key <a href="/trust#operator">(${esc(receipt.operator_key.slice(0, 12))}…)</a></dt><dd><code>${esc(receipt.statement)}\n\n${esc(receipt.signature)}</code></dd>` : ""}
 ${s.endorse_sig ? `<dt>Endorsement signature</dt><dd><code>${esc(`agentwork-endorse-v1\n${s.url}\n${s.endorsed_at}\n${s.endorse_note}`)}\n\n${esc(s.endorse_sig)}</code></dd>` : ""}
 </dl>
-<p class="small muted">Paste this into a browser console on any page of the site, or run it in Node. It reads the proof from the site and verifies it without asking agentwork anything.</p>
+<p class="small muted">Run this in a terminal. It reads the proof from the site and verifies it without asking agentwork anything.</p>
 <pre class="prompt"><code>${esc(verifyProofSnippet(s))}</code></pre>
 </details>`;
 }
@@ -641,22 +637,8 @@ ${term("failing", badge("warn", `Check failing (1/${MAX_FAILS})`), `<p>The last 
   );
 }
 
-const verifySnippet = (c: Config) => `const res = await fetch("${c.site}/api/log?limit=1000").then((r) => r.json());
-const sha = async (s) => [...new Uint8Array(await crypto.subtle.digest("SHA-256",
-  new TextEncoder().encode(s)))].map((b) => b.toString(16).padStart(2, "0")).join("");
-let prev = "0".repeat(64);
-for (const e of res.events) {
-  const hash = await sha([prev, e.seq, e.ts, e.type, e.site_id, e.url_hash, e.detail].join("\\n"));
-  if (e.prev !== prev || e.hash !== hash) throw new Error("chain broken at #" + e.seq);
-  if (e.url && (await sha(e.url)) !== e.url_hash) throw new Error("url changed at #" + e.seq);
-  prev = hash;
-}
-const b64 = (x) => Uint8Array.from(atob(x.replace(/-/g, "+").replace(/_/g, "/")), (ch) => ch.charCodeAt(0));
-const h = res.head;
-const key = await crypto.subtle.importKey("raw", b64(h.operator_key), { name: "Ed25519" }, false, ["verify"]);
-const signed = await crypto.subtle.verify({ name: "Ed25519" }, key, b64(h.signature),
-  new TextEncoder().encode(["agentwork-log-head-v1", h.seq, h.hash, h.ts].join("\\n")));
-console.log("chain ok:", prev === h.hash, "| head signed by operator:", signed);`;
+const LOG_SH = "# Recompute the whole chain, then check the operator's signature on its head.\n# Needs curl, jq, shasum and OpenSSL 3 or newer (macOS's built-in openssl is too old: use Homebrew's).\nlog=$(curl -s \"__SITE__/api/log?limit=1000\")\nprev=$(printf '0%.0s' $(seq 64))\nwhile IFS=$'\\x1f' read -r seq ts type id url_hash detail p hash; do\n  calc=$(printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$prev\" \"$seq\" \"$ts\" \"$type\" \"$id\" \"$url_hash\" \"$detail\" | shasum -a 256 | cut -d' ' -f1)\n  [ \"$p\" = \"$prev\" ] && [ \"$calc\" = \"$hash\" ] || { echo \"chain broken at #$seq\"; break; }\n  prev=$calc\ndone < <(printf %s \"$log\" | jq -r '.events[] | [.seq, .ts, .type, .site_id, .url_hash, .detail, .prev, .hash] | map(tostring) | join(\"\\u001f\")')\n[ \"$prev\" = \"$(printf %s \"$log\" | jq -r .head.hash)\" ] && echo \"chain ok, head $prev\"\n\nb64d() { local s; s=$(printf %s \"$1\" | tr '_-' '/+'); while [ $((${#s} % 4)) -ne 0 ]; do s=\"$s=\"; done; printf %s \"$s\" | openssl base64 -d -A; }\ntmp=$(mktemp -d)\n{ printf '\\x30\\x2a\\x30\\x05\\x06\\x03\\x2b\\x65\\x70\\x03\\x21\\x00'; b64d \"$(printf %s \"$log\" | jq -r .head.operator_key)\"; } | openssl pkey -pubin -inform DER -out \"$tmp/key.pem\"\nb64d \"$(printf %s \"$log\" | jq -r .head.signature)\" > \"$tmp/sig\"\nprintf %s \"$log\" | jq -j '.head | \"agentwork-log-head-v1\\n\\(.seq)\\n\\(.hash)\\n\\(.ts)\"' > \"$tmp/msg\"\nopenssl pkeyutl -verify -pubin -inkey \"$tmp/key.pem\" -rawin -in \"$tmp/msg\" -sigfile \"$tmp/sig\"";
+const verifySnippet = (c: Config) => LOG_SH.replace("__SITE__", c.site);
 
 export function logPage(c: Config, events: LogEvent[], head: SignedHead): string {
   return layout(
@@ -673,7 +655,7 @@ export function logPage(c: Config, events: LogEvent[], head: SignedHead): string
 </div>
 <details class="verify">
 <summary>Verify it yourself</summary>
-<p class="small muted">Paste this into your browser's console, or run it in any JavaScript runtime with fetch. The full log is at <a href="/api/log">/api/log</a> (paginated with <code>after</code>), and it checks the operator's signature on the head too.</p>
+<p class="small muted">Run this in a terminal. It recomputes every hash, then checks the operator's signature on the head. The full log is at <a href="/api/log">/api/log</a> (paginated with <code>after</code>).</p>
 <pre class="prompt"><code>${esc(verifySnippet(c))}</code></pre>
 </details>
 
