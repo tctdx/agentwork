@@ -119,6 +119,7 @@ const operators = new Map<string, Promise<Operator>>();
 
 /** The directory's own key, from a PKCS#8 secret (base64). Its public half is published. */
 export function operator(pkcs8Base64: string): Promise<Operator> {
+  if (!pkcs8Base64) return Promise.reject(new Error("OPERATOR_SIGNING_KEY is not set"));
   let cached = operators.get(pkcs8Base64);
   if (!cached) {
     cached = (async () => {
@@ -134,6 +135,8 @@ export function operator(pkcs8Base64: string): Promise<Operator> {
       };
     })();
     operators.set(pkcs8Base64, cached);
+    // A key that fails to load must not stay cached as a failure for the life of the isolate.
+    cached.catch(() => operators.delete(pkcs8Base64));
   }
   return cached;
 }

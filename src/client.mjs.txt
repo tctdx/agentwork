@@ -77,8 +77,9 @@ async function register(url) {
   console.log("Listing id: " + r.id);
   console.log("Proof token (publish it on the site, then verify):\n");
   console.log(token + "\n");
-  if (r.publish.file) console.log("Either serve it as plain text at " + r.publish.file + "\nor add to the page's <head>:");
-  else console.log("Add to the <head> of that exact page:");
+  console.log("Strongest: a DNS TXT record named " + r.publish.dns.name + " with the token as its value.");
+  if (r.publish.file) console.log("Or serve it as plain text at " + r.publish.file);
+  console.log("Or add to the <head> of that exact page:");
   console.log('<meta name="agentwork-verify" content="' + token + '">\n');
   console.log("Then: node agentwork.mjs verify " + r.id);
 }

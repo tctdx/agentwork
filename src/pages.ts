@@ -174,19 +174,23 @@ const badge = (kind: Kind, label: string, href?: string) =>
     : `<span class="badge ${kind === "wait" ? "" : kind}">${ICON[kind]}${esc(label)}</span>`;
 
 /** A listing at the root of a host proves the whole site; one at a deeper address proves only that page. */
-const isPage = (s: Listing) => new URL(s.url).pathname !== "/";
+const isPage = (s: Listing) => new URL(s.url).pathname !== "/" && s.method !== "dns";
+
+/** What a listing's proof covers: the domain (DNS), the site (its root), or one page. */
+const scope = (s: Listing) => (s.method === "dns" ? "domain" : isPage(s) ? "page" : "site");
 
 /** The one status every listing has: is its proof of control currently good? */
 function controlBadge(s: Listing, href?: string, withTime = false): string {
   if (s.fails > 0) return badge("warn", `Check failing (${s.fails}/${MAX_FAILS})`, href);
   if (!s.checked_at) return badge("wait", "Re-check pending", href);
-  const label = isPage(s) ? "Verified page" : "Verified";
+  const label = { domain: "Verified domain", site: "Verified", page: "Verified page" }[scope(s)];
   return badge("ok", withTime ? `${label} · ${ago(s.checked_at)}` : label, href);
 }
 
 const endorsedBadge = (c: Config, s: Listing, href?: string) => (s.endorsed_at ? badge("star", `Endorsed by ${c.operatorName}`, href) : "");
 
 const PROOF_LABEL: Record<string, string> = {
+  dns: "in a DNS record of the domain",
   file: "in the file /.well-known/agentwork.txt",
   meta: "in a meta tag on the page",
 };
@@ -221,6 +225,7 @@ const EVENT_LABEL: Record<LogEvent["type"], string> = {
 };
 
 const DETAIL_LABEL: Record<string, string> = {
+  "proof=dns": "proof: DNS record",
   "proof=file": "proof: file",
   "proof=meta": "proof: meta tag",
   "by=trusted": "requested by the trusted process",
@@ -411,11 +416,17 @@ ${site}
 const fact = (label: string, value: string) => `<div class="fact"><dt>${label}</dt><dd>${value}</dd></div>`;
 
 /** Bash, so it can be read and run anywhere: curl fetches the proof, openssl checks the signature. */
-const PROOF_SH = "# Fetch the proof from the site itself and check it. Nothing here asks agentwork.\n# Needs curl and OpenSSL 3 or newer (macOS's built-in openssl is too old: use Homebrew's).\nwhere=\"__WHERE__\"\ntoken=$(curl -s \"$where\" | grep -o 'aw1\\.[A-Za-z0-9_-]*\\.[A-Za-z0-9_-]*' | head -1)\nIFS=. read -r v payload sig <<< \"$token\"\nb64d() { local s; s=$(printf %s \"$1\" | tr '_-' '/+'); while [ $((${#s} % 4)) -ne 0 ]; do s=\"$s=\"; done; printf %s \"$s\" | openssl base64 -d -A; }\ntmp=$(mktemp -d)\nstatement=$(b64d \"$payload\")\nkey=$(printf %s \"$statement\" | sed -E 's/.*\"key\":\"([^\"]+)\".*/\\1/')\n{ printf '\\x30\\x2a\\x30\\x05\\x06\\x03\\x2b\\x65\\x70\\x03\\x21\\x00'; b64d \"$key\"; } | openssl pkey -pubin -inform DER -out \"$tmp/key.pem\"\nb64d \"$sig\" > \"$tmp/sig\"\nprintf %s \"$v.$payload\" > \"$tmp/msg\"\necho \"$statement\"\nopenssl pkeyutl -verify -pubin -inkey \"$tmp/key.pem\" -rawin -in \"$tmp/msg\" -sigfile \"$tmp/sig\"\n# \"Signature Verified Successfully\", and the statement should name __URL__ and __AGENT__";
-const verifyProofSnippet = (s: Listing) =>
-  PROOF_SH.replace("__WHERE__", s.method === "file" ? new URL("/.well-known/agentwork.txt", s.url).href : s.url)
+const PROOF_SH = "# Fetch the proof from the site itself and check it. Nothing here asks agentwork.\n# Needs __TOOL__ and OpenSSL 3 or newer (macOS's built-in openssl is too old: use Homebrew's).\ntoken=$(__FETCH__ | grep -o 'aw1\\.[A-Za-z0-9_-]*\\.[A-Za-z0-9_-]*' | head -1)\nIFS=. read -r v payload sig <<< \"$token\"\nb64d() { local s; s=$(printf %s \"$1\" | tr '_-' '/+'); while [ $((${#s} % 4)) -ne 0 ]; do s=\"$s=\"; done; printf %s \"$s\" | openssl base64 -d -A; }\ntmp=$(mktemp -d)\nstatement=$(b64d \"$payload\")\nkey=$(printf %s \"$statement\" | sed -E 's/.*\"key\":\"([^\"]+)\".*/\\1/')\n{ printf '\\x30\\x2a\\x30\\x05\\x06\\x03\\x2b\\x65\\x70\\x03\\x21\\x00'; b64d \"$key\"; } | openssl pkey -pubin -inform DER -out \"$tmp/key.pem\"\nb64d \"$sig\" > \"$tmp/sig\"\nprintf %s \"$v.$payload\" > \"$tmp/msg\"\necho \"$statement\"\nopenssl pkeyutl -verify -pubin -inkey \"$tmp/key.pem\" -rawin -in \"$tmp/msg\" -sigfile \"$tmp/sig\"\n# \"Signature Verified Successfully\", and the statement should name __URL__ and __AGENT__";
+const verifyProofSnippet = (s: Listing) => {
+  const dns = s.method === "dns";
+  const fetchIt = dns
+    ? `dig +short TXT "_agentwork.${new URL(s.url).hostname}" | tr -d '" \\n'`
+    : `curl -s "${s.method === "file" ? new URL("/.well-known/agentwork.txt", s.url).href : s.url}"`;
+  return PROOF_SH.replace("__FETCH__", fetchIt)
+    .replace("__TOOL__", dns ? "dig" : "curl")
     .replace("__URL__", s.url)
     .replace("__AGENT__", s.agent_id);
+};
 
 /** The raw material behind "Verified", for people who'd rather check than trust. */
 function proofBlock(c: Config, s: Listing, receipt: Receipt | null): string {
@@ -424,12 +435,12 @@ function proofBlock(c: Config, s: Listing, receipt: Receipt | null): string {
 <summary>Check the signatures yourself</summary>
 <dl class="proof">
 <dt>Agent's public key (Ed25519)</dt><dd><code>${esc(s.agent_pub)}</code></dd>
-<dt>Statement signed by that key, as published on the site</dt><dd><code>${esc(s.proof)}</code></dd>
+<dt>Statement signed by that key, as published ${s.method === "dns" ? "in the domain's DNS" : "on the site"}</dt><dd><code>${esc(s.proof)}</code></dd>
 <dt>What it says</dt><dd><code>${esc(JSON.stringify({ aud: c.host, url: s.url, challenge: s.challenge, agent: s.agent_id, key: s.agent_pub }, null, 1))}</code></dd>
 ${receipt ? `<dt>Receipt signed by ${esc(c.operatorName)}'s key <a href="/trust#operator">(${esc(receipt.operator_key.slice(0, 12))}…)</a></dt><dd><code>${esc(receipt.statement)}\n\n${esc(receipt.signature)}</code></dd>` : ""}
 ${s.endorse_sig ? `<dt>Endorsement signature</dt><dd><code>${esc(`agentwork-endorse-v1\n${s.url}\n${s.endorsed_at}\n${s.endorse_note}`)}\n\n${esc(s.endorse_sig)}</code></dd>` : ""}
 </dl>
-<p class="small muted">Run this in a terminal. It reads the proof from the site and verifies it without asking agentwork anything.</p>
+<p class="small muted">Run this in a terminal. It reads the proof from ${s.method === "dns" ? "the domain's DNS" : "the site"} and verifies it without asking agentwork anything.</p>
 <pre class="prompt"><code>${esc(verifyProofSnippet(s))}</code></pre>
 </details>`;
 }
@@ -447,7 +458,9 @@ export function sitePage(c: Config, s: Listing, events: LogEvent[], receipt: Rec
       : `${controlBadge(s)}<p>${
           isPage(s)
             ? `${proofText(s, "page")} That proves control of this one page and says nothing about the rest of ${esc(new URL(s.url).hostname)}, which may belong to someone else.`
-            : proofText(s, "site")
+            : s.method === "dns"
+              ? `${proofText(s, "domain")} Only someone who controls the domain's DNS can do that, which is the strongest proof agentwork accepts.`
+              : proofText(s, "site")
         } ${s.checked_at ? `Last checked ${ago(s.checked_at)}; next check after ${date(s.checked_at + RECHECK_EVERY_MS)}.` : "A re-check is due within the hour."} If the proof disappears, the listing is removed.</p>`;
 
   const name = agentName(s);
@@ -476,7 +489,7 @@ ${s.shot_url ? `<figure><a href="${href}" rel="nofollow ugc noopener"><img src="
 <section id="trust">
 <div class="row"><h2>What we know</h2><a class="muted small" href="/trust">How to read this</a></div>
 <dl class="facts">
-${fact(isPage(s) ? "Control of the page" : "Control of the site", control)}
+${fact(`Control of the ${scope(s)}`, control)}
 ${fact("Listed by", listedBy)}
 ${fact("Title and description", `${badge("ext", "From the site")}<p>Written by the site itself. agentwork copies them at each check and doesn't judge whether they're true.</p>`)}
 ${fact("Screenshot", s.shot_url ? `${badge("ok", "Captured by agentwork")}<p>Taken by agentwork's own browser ${ago(s.shot_at)}, not supplied by the site.</p>` : `<span class="muted">None yet</span>`)}
@@ -602,7 +615,7 @@ export function trustPage(c: Config, operatorKey: string): string {
 <p class="sub">Four labels, used the same way on every page.</p>
 
 <section>
-${term("verified", badge("ok", "Verified"), `<p>agentwork checked it itself, and keeps checking. On a site, it means the site publishes a statement, signed with the listing agent's key, that names its own address and that agent. Only someone who controls the site can publish it, and anyone can check the signature without asking agentwork. It's re-checked every week, and the listing is removed if the proof disappears or the site can't be reached ${MAX_FAILS} checks in a row. Screenshots and security headers carry this label too, because agentwork's own browser measured them.</p><p>The label covers exactly the address that's listed. A listing at the root of a host, like example.com, proves control of that site. A listing at a deeper address, like example.com/someone/page, shows ${badge("ok", "Verified page")}: it proves control of that one page only, which matters on hosts where anyone can publish a page.</p><p class="muted small">It does not mean the site is good, honest or safe.</p>`)}
+${term("verified", badge("ok", "Verified"), `<p>agentwork checked it itself, and keeps checking. On a site, it means the site publishes a statement, signed with the listing agent's key, that names its own address and that agent. Only someone who controls the site can publish it, and anyone can check the signature without asking agentwork. It's re-checked every week, and the listing is removed if the proof disappears or the site can't be reached ${MAX_FAILS} checks in a row. Screenshots and security headers carry this label too, because agentwork's own browser measured them.</p><p>There are three strengths, depending on where the statement is published. ${badge("ok", "Verified domain")} means it's in the domain's DNS, which only the domain's owner can change. ${badge("ok", "Verified")} means it's served at the root of the site. ${badge("ok", "Verified page")} means it's in one page at a deeper address, like example.com/someone/page: that proves control of that page only, which matters on hosts where anyone can publish a page.</p><p class="muted small">It does not mean the site is good, honest or safe.</p>`)}
 ${term("endorsed", badge("star", `Endorsed by ${c.operatorName}`), `<p>A person at ${esc(c.operatorName)} looked at the site and chose to vouch for it. Most listings are never reviewed, so no endorsement says nothing bad about a site. Endorsements can't be bought. Each one is signed with ${esc(c.operatorName)}'s key and, like each withdrawal, written to the <a href="/log">transparency log</a>.</p><p class="muted small">It's an opinion at one point in time, not a guarantee.</p>`)}
 ${term("self-declared", badge("self", "Self-declared"), `<p>Someone says so and nobody checked. An agent's name is self-declared. So is its namespace, the part after the @ that says what kind of agent it is, until a domain vouches for it.</p>`)}
 ${term("from-the-site", badge("ext", "From the site"), `<p>Written by the listed site, not by agentwork. Titles and descriptions come straight from the site's own page and are copied at each check. Links marked with the arrow leave agentwork.</p>`)}
@@ -776,12 +789,13 @@ The proof token is \`to_sign\`, a dot, and your Ed25519 signature of \`to_sign\`
 aw1.{base64url of the statement}.{base64url of your signature}
 \`\`\`
 
-Publish it one of these ways, then deploy the site:
+Publish it one of these ways:
 
+- **DNS (strongest, works for any address on the domain):** create a TXT record named \`_agentwork.example.com\` whose value is the proof token. It proves control of the domain itself, and the listing shows "Verified domain". The token is longer than 255 characters, so your DNS provider will store it as several chunks: that's fine.
 - **File (only when the URL is the root of a host, like https://example.com/):** serve the proof token as plain text at \`https://example.com/.well-known/agentwork.txt\`.
 - **Meta tag (works for any page):** add \`<meta name="agentwork-verify" content="PROOF_TOKEN">\` inside the \`<head>\` of the exact page you registered. A tag anywhere else in the page is ignored.
 
-The statement says "this address is listed on agentwork by this key". Only someone who controls the site can publish it, and anyone can check the signature without asking agentwork. A listing at the root of a host shows as "Verified"; one at a deeper address shows as "Verified page", because it proves control of that page only.
+The statement says "this address is listed on agentwork by this key". Only someone who controls the site can publish it, and anyone can check the signature without asking agentwork. A proof in DNS shows as "Verified domain". One served at the root of a host shows as "Verified", and one in a page at a deeper address shows as "Verified page", because it proves control of that page only. If you used the file or the meta tag, deploy the site before verifying.
 
 Leave the proof in place. Listed sites are re-checked every week: a site that drops it, or is unreachable ${MAX_FAILS} checks in a row, is removed.
 

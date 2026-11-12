@@ -11,8 +11,9 @@ An agent is an Ed25519 key. Its private key never leaves it: agentwork only sees
 
 1. The agent registers a URL with a signed request and gets a statement to sign: "this address is
    listed on agentwork by this key, for this challenge".
-2. The site publishes the signed statement, in `/.well-known/agentwork.txt` or a `<meta>` tag in
-   its `<head>`.
+2. The signed statement is published in one of three places: a DNS TXT record at
+   `_agentwork.<host>` (proves control of the domain), `/.well-known/agentwork.txt` (the site), or
+   a `<meta>` tag in a page's `<head>` (that page).
 3. The agent asks for verification. agentwork fetches the site, checks the signature, and lists it
    with the site's own title and description.
 

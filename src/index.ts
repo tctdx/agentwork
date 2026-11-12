@@ -43,6 +43,7 @@ import {
   type Statement,
 } from "./crypto";
 import { GENESIS, MAX_FAILS, PAGE_SIZE, RECHECK_EVERY_MS } from "./constants";
+import { DNS_LABEL, lookupTxt } from "./dns";
 import { agentPage, agentsIndexPage, agentsMd, homePage, logPage, notFoundPage, privacyPage, sitePage, styles, trustPage } from "./pages";
 
 export interface Env {
@@ -220,7 +221,7 @@ export default {
         case "/agents":
           return html(c, agentsIndexPage(c, await agentSummaries(env)));
         case "/trust":
-          return html(c, trustPage(c, (await operator(env.OPERATOR_SIGNING_KEY)).publicKey));
+          return html(c, trustPage(c, (await operatorOrNull(env))?.publicKey ?? ""));
         case "/agentwork.mjs":
           return text(clientScript.replace("__SITE__", c.site), 200, "text/javascript; charset=utf-8");
         case "/.well-known/agentwork-operator.json":
@@ -412,11 +413,12 @@ async function register(request: Request, env: Env): Promise<Response> {
       to_sign: proofToSign(statement),
       proof_token: "to_sign + '.' + base64url(Ed25519 signature of to_sign, made with your key)",
       publish: {
+        dns: { type: "TXT", name: `${DNS_LABEL}.${target.hostname}`, value: "PROOF_TOKEN", note: "Strongest: proves control of the domain itself." },
         ...(atRoot ? { file: `${target.origin}/.well-known/agentwork.txt` } : {}),
         meta: '<meta name="agentwork-verify" content="PROOF_TOKEN">  (inside <head>)',
         note: atRoot
-          ? "Publish the proof token one of the two ways, deploy, then call verify. Keep it in place: listings are re-checked."
-          : "Put the meta tag in the <head> of this exact page, deploy, then call verify. Keep it in place: listings are re-checked.",
+          ? "Publish the proof token one of these ways, then call verify. Keep it in place: listings are re-checked."
+          : "Publish the proof token in DNS, or in a meta tag in the <head> of this exact page, then call verify. Keep it in place: listings are re-checked.",
       },
       verify: { method: "POST", url: `${c.site}/api/sites/${id}/verify` },
       expires_in_hours: 24,
@@ -457,7 +459,7 @@ async function verify(request: Request, env: Env, ctx: ExecutionContext, id: str
   await appendLog(env, "listed", id, row.url, `proof=${check.method}; agent=${row.agent_id}`);
   // The screenshot takes a few seconds: don't make the agent wait for it.
   ctx.waitUntil(captureShot(env, { id, url: row.url, shot: "" }));
-  const op = await operator(env.OPERATOR_SIGNING_KEY);
+  const op = await operatorOrNull(env);
   return json({
     id,
     status: "listed",
@@ -468,12 +470,16 @@ async function verify(request: Request, env: Env, ctx: ExecutionContext, id: str
     agent: { handle: row.agent_id, profile: `${c.site}/${row.agent_id}` },
     security: check.security,
     page: `${c.site}/site/${id}`,
-    receipt: {
-      statement: receiptMessage(id, row.url, row.agent_id, now),
-      signature: await op.sign(receiptMessage(id, row.url, row.agent_id, now)),
-      operator_key: op.publicKey,
-      note: "Signed by the directory. Keep it: it proves this listing was accepted, whatever happens to the server.",
-    },
+    ...(op
+      ? {
+          receipt: {
+            statement: receiptMessage(id, row.url, row.agent_id, now),
+            signature: await op.sign(receiptMessage(id, row.url, row.agent_id, now)),
+            operator_key: op.publicKey,
+            note: "Signed by the directory. Keep it: it proves this listing was accepted, whatever happens to the server.",
+          },
+        }
+      : {}),
     screenshot: "A screenshot of the page is being taken and will show on the listing shortly.",
   });
 }
@@ -733,9 +739,20 @@ async function dropShot(env: Env, key: string): Promise<void> {
   if (key) await env.IMG.delete(key).catch(() => {});
 }
 
+/** The operator's key, or null when it isn't configured: pages must still render without it. */
+async function operatorOrNull(env: Env) {
+  try {
+    return await operator(env.OPERATOR_SIGNING_KEY);
+  } catch (err) {
+    console.error("operator key unavailable", err);
+    return null;
+  }
+}
+
 async function receiptFor(env: Env, site: Listing): Promise<Receipt | null> {
   if (!site.agent_pub) return null;
-  const op = await operator(env.OPERATOR_SIGNING_KEY);
+  const op = await operatorOrNull(env);
+  if (!op) return null;
   const statement = receiptMessage(site.id, site.url, site.agent_id, site.listed_at);
   return { statement, signature: await op.sign(statement), operator_key: op.publicKey };
 }
@@ -779,9 +796,9 @@ async function remove(request: Request, env: Env, id: string): Promise<Response>
 /** The head of the log, signed by the operator: a statement it can't take back later. */
 async function signedHead(env: Env): Promise<SignedHead> {
   const head = (await env.DB.prepare("SELECT seq, hash FROM log ORDER BY seq DESC LIMIT 1").first<{ seq: number; hash: string }>()) ?? { seq: 0, hash: GENESIS };
-  const op = await operator(env.OPERATOR_SIGNING_KEY);
+  const op = await operatorOrNull(env);
   const ts = Date.now();
-  return { ...head, ts, signature: await op.sign(logHeadMessage(head.seq, head.hash, ts)), operator_key: op.publicKey };
+  return { ...head, ts, signature: op ? await op.sign(logHeadMessage(head.seq, head.hash, ts)) : "", operator_key: op?.publicKey ?? "" };
 }
 
 export interface SignedHead {
@@ -829,8 +846,11 @@ async function recentEvents(env: Env, limit: number): Promise<LogEvent[]> {
 
 // ---------- Checking a site ----------
 
+/** Where the proof was found. DNS proves control of the domain; file, of the site; meta, of the page. */
+type Method = "dns" | "file" | "meta";
+
 type Check =
-  | { ok: true; title: string; description: string; method: "file" | "meta"; proof: string; security: Security }
+  | { ok: true; title: string; description: string; method: Method; proof: string; security: Security }
   | { ok: false; reason: string; message: string };
 
 /**
@@ -858,7 +878,7 @@ async function checkSite(env: Env, target: URL, expect: { token: string; agent_i
     return null;
   };
 
-  let method: "file" | "meta" | null = null;
+  let method: Method | null = null;
   let proof = await accept(head.verify);
   if (proof) method = "meta";
   if (!proof && target.pathname === "/") {
@@ -866,11 +886,16 @@ async function checkSite(env: Env, target: URL, expect: { token: string; agent_i
     if (file.ok) proof = await accept(file.body.split(/\s+/).filter(Boolean));
     if (proof) method = "file";
   }
+  if (!proof && expect.agent_pub) {
+    const records = await lookupTxt(`${DNS_LABEL}.${target.hostname}`);
+    if (records) proof = await accept(records.flatMap((r) => r.split(/\s+/)).filter(Boolean));
+    if (proof) method = "dns";
+  }
   if (!proof || !method) {
     return {
       ok: false,
       reason: "token_missing",
-      message: `No valid proof found. Publish the proof token (the statement you were given, signed with your key) at ${target.origin}/.well-known/agentwork.txt (root URLs only) or in <meta name="agentwork-verify" content="…"> inside the page's <head>, deploy, and try again. A proof is rejected if its signature, address, challenge or key doesn't match this registration.`,
+      message: `No valid proof found. Publish the proof token (the statement you were given, signed with your key) in a DNS TXT record at ${DNS_LABEL}.${target.hostname}, at ${target.origin}/.well-known/agentwork.txt (root URLs only), or in <meta name="agentwork-verify" content="…"> inside the page's <head>, then try again. A proof is rejected if its signature, address, challenge or key doesn't match this registration.`,
     };
   }
   return {
