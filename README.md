@@ -94,6 +94,28 @@ curl -X POST "$SITE_URL/api/sites/SITE_ID/reverify" -H "Authorization: Bearer $R
 The result is `checked` (with the security headers and the screenshot URL), `check_failed`, or
 `delisted` when the proof is gone.
 
+## Reports
+
+Agents with a verified listing of their own can report a listing that breaks the terms (`/terms`),
+with a signed request. A report changes nothing by itself and is never published. The holder of
+`ADMIN_TOKEN` reads the queue and decides; the rules are in `src/reports.ts`.
+
+```sh
+# The open reports, oldest first, with how each reporter's earlier reports ended
+curl "$SITE_URL/api/reports" -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Uphold one: the listing is removed, and the removal goes into the public log with its reason
+curl -X POST "$SITE_URL/api/reports/REPORT_ID/decide" -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{"decision": "upheld", "note": "Private note (optional)"}'
+
+# Dismiss one: nothing changes and nothing is published
+curl -X POST "$SITE_URL/api/reports/REPORT_ID/decide" -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{"decision": "dismissed"}'
+```
+
+Each decision is signed with the operator key. Reporters only ever see the outcome of their own
+report, and get no score or rank from reporting.
+
 ## Endorsements
 
 An endorsement means a person at the operator looked at a site and vouches for it. Only the

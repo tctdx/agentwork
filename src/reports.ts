@@ -46,6 +46,7 @@ export interface Report {
   status: "open" | "upheld" | "dismissed";
   decided_at: number;
   decision_note: string;
+  decision_sig: string;
   created_at: number;
 }
 
@@ -105,6 +106,7 @@ export async function fileReport(
     status: "open",
     decided_at: 0,
     decision_note: "",
+    decision_sig: "",
     created_at: Date.now(),
   };
   try {
@@ -132,7 +134,7 @@ export const reportForReporter = (r: Report) => ({
   note: r.note,
   status: r.status,
   filed_at: r.created_at,
-  ...(r.decided_at ? { decided_at: r.decided_at } : {}),
+  ...(r.decided_at ? { decided_at: r.decided_at, decision_signature: r.decision_sig } : {}),
 });
 
 export async function getReport(db: D1Database, id: string): Promise<Report | null> {
@@ -171,13 +173,20 @@ export type Decided =
  * the same category; removing the listing itself is the caller's job, so it goes through the same
  * path, and the same log entry, as any other removal.
  */
-export async function decideReport(db: D1Database, id: string, decision: "upheld" | "dismissed", note: string): Promise<Decided> {
+export async function decideReport(
+  db: D1Database,
+  id: string,
+  decision: "upheld" | "dismissed",
+  note: string,
+  sign: (report: Report, ts: number) => Promise<string>,
+): Promise<Decided> {
   const report = await getReport(db, id);
   if (!report) return { ok: false, status: 404, error: "not_found", message: "No report with this id." };
   if (report.status !== "open") return { ok: false, status: 409, error: "already_decided", message: `This report was already ${report.status}.` };
   const now = Date.now();
   const clean = note.replace(/\s+/g, " ").trim().slice(0, 300);
-  await db.prepare("UPDATE reports SET status = ?, decided_at = ?, decision_note = ? WHERE id = ?").bind(decision, now, clean, id).run();
+  const signature = await sign(report, now);
+  await db.prepare("UPDATE reports SET status = ?, decided_at = ?, decision_note = ?, decision_sig = ? WHERE id = ?").bind(decision, now, clean, signature, id).run();
   let alsoClosed = 0;
   if (decision === "upheld") {
     const others = await db
@@ -186,7 +195,7 @@ export async function decideReport(db: D1Database, id: string, decision: "upheld
       .run();
     alsoClosed = others.meta.changes ?? 0;
   }
-  return { ok: true, report: { ...report, status: decision, decided_at: now, decision_note: clean }, alsoClosed };
+  return { ok: true, report: { ...report, status: decision, decided_at: now, decision_note: clean, decision_sig: signature }, alsoClosed };
 }
 
 /** Public numbers only: how many reports there were and how they ended. Never who or what. */

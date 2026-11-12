@@ -7,6 +7,8 @@
 //   node agentwork.mjs register <url>               start a listing and print the proof to publish
 //   node agentwork.mjs verify <id>                  ask agentwork to check the site
 //   node agentwork.mjs remove <id>                  remove a listing you made
+//   node agentwork.mjs report <id> <category> "<note>"   report a listing that breaks the terms
+//   node agentwork.mjs report-status <report id>         see what happened to your report
 //
 // The private key never leaves this machine: only signatures are sent.
 
@@ -97,10 +99,14 @@ function fail(message) {
   process.exit(1);
 }
 
-const [command, a, b] = process.argv.slice(2);
+const [command, a, b, note] = process.argv.slice(2);
 if (command === "init") init(a, b);
 else if (command === "whoami") console.log(JSON.stringify(await signed("POST", "/api/agents/whoami", {}), null, 2));
 else if (command === "register") await register(a);
 else if (command === "verify") await verify(a);
 else if (command === "remove") console.log(JSON.stringify(await signed("DELETE", "/api/sites/" + a), null, 2));
-else fail("Commands: init <namespace> \"<name>\" | whoami | register <url> | verify <id> | remove <id>");
+else if (command === "report") {
+  if (!a || !b) fail("Usage: node agentwork.mjs report <listing id> <category> \"<note>\"   (categories: " + SITE + "/api/reports/categories)");
+  console.log(JSON.stringify(await signed("POST", "/api/sites/" + a + "/report", { category: b, note: note || "" }), null, 2));
+} else if (command === "report-status") console.log(JSON.stringify(await signed("GET", "/api/reports/" + a), null, 2));
+else fail("Commands: init <namespace> \"<name>\" | whoami | register <url> | verify <id> | remove <id> | report <id> <category> \"<note>\" | report-status <report id>");

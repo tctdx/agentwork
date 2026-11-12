@@ -37,6 +37,7 @@ import {
   proofToSign,
   readProof,
   receiptMessage,
+  reportDecisionMessage,
   requestMessage,
   sha256Hex,
   verifySignature,
@@ -44,7 +45,8 @@ import {
 } from "./crypto";
 import { GENESIS, MAX_FAILS, PAGE_SIZE, RECHECK_EVERY_MS, sitePath } from "./constants";
 import { DNS_LABEL, lookupTxt } from "./dns";
-import { agentPage, agentsIndexPage, agentsMd, homePage, logPage, notFoundPage, privacyPage, sitePage, styles, trustPage } from "./pages";
+import { agentPage, agentsIndexPage, agentsMd, homePage, logPage, notFoundPage, privacyPage, sitePage, styles, termsPage, trustPage } from "./pages";
+import { decideReport, fileReport, getReport, REPORT_CATEGORIES, reportForReporter, reportQueue, reportTotals, type Report } from "./reports";
 
 export interface Env {
   DB: D1Database;
@@ -161,7 +163,8 @@ export interface LogEvent {
     | "unendorsed"
     | "claimed"
     | "agent_verified"
-    | "agent_unverified";
+    | "agent_unverified"
+    | "report_upheld";
   site_id: string;
   url: string | null;
   url_hash: string;
@@ -184,6 +187,7 @@ const SHOT_BUDGET_MS = 40_000; // whole capture, browser launch included
 const LIMITS = {
   register: { n: 10, windowSec: 3600 },
   verify: { n: 30, windowSec: 3600 },
+  report: { n: 20, windowSec: 3600 },
 } as const;
 const userAgent = (env: Env) => `agentwork-verifier/1.0 (+${config(env).site}/agents.md)`;
 const LISTING_COLUMNS =
@@ -243,6 +247,8 @@ export default {
         case "/agents.md":
         case "/llms.txt":
           return text(agentsMd(c), 200, "text/markdown; charset=utf-8");
+        case "/terms":
+          return html(c, termsPage(c));
         case "/privacy":
           return html(c, privacyPage(c));
         case "/style.css":
@@ -339,6 +345,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext, path: stri
     });
   }
 
+  if (parts[0] === "reports") return reports(request, env, parts, url);
+
   if (parts[0] !== "sites") return apiError(404, "not_found", `Unknown endpoint. See ${config(env).site}/agents.md`);
   const id = parts[1];
 
@@ -352,6 +360,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext, path: stri
   if (id && parts[2] === "verify" && request.method === "POST") return verify(request, env, ctx, id);
   if (id && parts[2] === "reverify" && request.method === "POST") return reverify(request, env, id);
   if (id && parts[2] === "endorse" && (request.method === "POST" || request.method === "DELETE")) return endorse(request, env, id);
+  if (id && parts[2] === "report" && request.method === "POST") return reportSite(request, env, id);
   if (id && !parts[2] && request.method === "GET") return status(env, id);
   if (id && !parts[2] && request.method === "DELETE") return remove(request, env, id);
   return apiError(405, "method_not_allowed", `Wrong method for this endpoint. See ${config(env).site}/agents.md`);
@@ -571,6 +580,112 @@ async function endorse(request: Request, env: Env, id: string): Promise<Response
   await env.DB.prepare("UPDATE sites SET endorsed_at = ?, endorse_note = ?, endorse_sig = ? WHERE id = ?").bind(ts, note, signature, id).run();
   await appendLog(env, "endorsed", id, row.url, note);
   return json({ id, endorsed: true, note, statement: endorseMessage(row.url, ts, note), signature, operator_key: op.publicKey });
+}
+
+// ---------- Reports ----------
+// The rules live in reports.ts. Here: who is asking (a signature or the admin token), then the call.
+
+const isAdmin = (request: Request, env: Env) => {
+  const bearer = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  return !!bearer && !!env.ADMIN_TOKEN && safeEqual(bearer, env.ADMIN_TOKEN);
+};
+
+/** An agent reports a listing. The report's id is a fingerprint of the exact message it signed. */
+async function reportSite(request: Request, env: Env, siteId: string): Promise<Response> {
+  if (await limited(request, env, "report")) return apiError(429, "rate_limited", "Too many reports from here. Try again in an hour.");
+  const raw = await request.text();
+  const who = await signer(request, env, raw);
+  if (who instanceof Response) return who;
+  const body = parseJson(raw);
+  if (!body) return apiError(400, "bad_json", `Send {"category": "…", "note": "…"}. Categories: ${Object.keys(REPORT_CATEGORIES).join(", ")}.`);
+
+  const timestamp = request.headers.get("x-agent-timestamp") ?? "";
+  const signed = requestMessage(config(env).host, who.namespace, request.method, new URL(request.url).pathname, timestamp, await sha256Hex(raw));
+  const filed = await fileReport(env.DB, {
+    id: (await sha256Hex(signed)).slice(0, 20),
+    siteId,
+    reporter: who.handle,
+    reporterPub: who.key,
+    category: body.category,
+    note: body.note,
+    body: raw,
+    signedAt: Number(timestamp),
+    signature: request.headers.get("x-agent-signature") ?? "",
+  });
+  if (!filed.ok) return apiError(filed.status, filed.error, filed.message);
+  return json(
+    {
+      ...reportForReporter(filed.report),
+      ...(filed.duplicate ? { duplicate: "You already reported this listing. This is your earlier report." } : {}),
+      what_happens: "A person reads it. Nothing changes on the listing unless they uphold it. Reports are private.",
+      check: { method: "GET", url: `${config(env).site}/api/reports/${filed.report.id}`, note: "Signed with the same key." },
+    },
+    filed.duplicate ? 200 : 201,
+  );
+}
+
+async function reports(request: Request, env: Env, parts: string[], url: URL): Promise<Response> {
+  const c = config(env);
+  // Public: the categories and how many reports there were. Never who or what.
+  if (parts.length === 2 && parts[1] === "categories" && request.method === "GET") return json({ categories: REPORT_CATEGORIES, terms: `${c.site}/terms` });
+  if (parts.length === 2 && parts[1] === "totals" && request.method === "GET") return json(await reportTotals(env.DB));
+
+  // The operator's queue.
+  if (parts.length === 1 && request.method === "GET") {
+    if (!isAdmin(request, env)) return apiError(401, "unauthorized", "Only the operator can read reports.");
+    const wanted = url.searchParams.get("status");
+    const status: Report["status"] = wanted === "upheld" || wanted === "dismissed" ? wanted : "open";
+    return json({ status, reports: await reportQueue(env.DB, status) });
+  }
+
+  const id = parts[1] ?? "";
+  if (!/^[0-9a-f]{20}$/.test(id)) return apiError(404, "not_found", "No report with this id.");
+
+  // The operator decides. Upholding removes the listing, signed and in the public log.
+  if (parts.length === 3 && parts[2] === "decide" && request.method === "POST") {
+    if (!isAdmin(request, env)) return apiError(401, "unauthorized", "Only the operator can decide on a report.");
+    const body = (await readJson(request)) ?? {};
+    const decision = body.decision;
+    if (decision !== "upheld" && decision !== "dismissed") return apiError(400, "bad_decision", 'decision must be "upheld" or "dismissed".');
+    const op = await operatorOrNull(env);
+    if (!op) return apiError(503, "no_operator_key", "The operator key is unavailable, so the decision can't be signed. Nothing was changed.");
+    const decided = await decideReport(env.DB, id, decision, typeof body.note === "string" ? body.note : "", (r, ts) =>
+      op.sign(reportDecisionMessage(r.id, r.url, r.category, decision, ts)),
+    );
+    if (!decided.ok) return apiError(decided.status, decided.error, decided.message);
+    const r = decided.report;
+
+    let removed = false;
+    if (decision === "upheld") {
+      const site = await env.DB.prepare("SELECT url, shot FROM sites WHERE id = ? AND status = 'listed'").bind(r.site_id).first<{ url: string; shot: string }>();
+      if (site) {
+        await env.DB.prepare("DELETE FROM sites WHERE id = ?").bind(r.site_id).run();
+        await dropShot(env, site.shot);
+        await appendLog(env, "report_upheld", r.site_id, site.url, `category=${r.category}; report=${r.id}`);
+        removed = true;
+      }
+    }
+    return json({
+      id: r.id,
+      status: r.status,
+      listing_removed: removed,
+      also_closed: decided.alsoClosed,
+      statement: reportDecisionMessage(r.id, r.url, r.category, decision, r.decided_at),
+      signature: r.decision_sig,
+      operator_key: op.publicKey,
+    });
+  }
+
+  // One report: its author (a signed request) sees the outcome; the operator sees everything.
+  if (parts.length === 2 && request.method === "GET") {
+    const report = await getReport(env.DB, id);
+    if (isAdmin(request, env)) return report ? json(report) : apiError(404, "not_found", "No report with this id.");
+    const who = await signer(request, env, "");
+    if (who instanceof Response) return who;
+    if (!report || report.reporter_pub !== who.key) return apiError(404, "not_found", "No report with this id from your key.");
+    return json(reportForReporter(report));
+  }
+  return apiError(405, "method_not_allowed", `Wrong method for this endpoint. See ${c.site}/agents.md`);
 }
 
 // ---------- Agent identity ----------

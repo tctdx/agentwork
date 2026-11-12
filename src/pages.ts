@@ -1,4 +1,7 @@
 import { MAX_FAILS, PAGE_SIZE, RECHECK_EVERY_MS, sitePath } from "./constants";
+import { isReportCategory, MAX_REPORT_NOTE, REPORT_CATEGORIES } from "./reports";
+
+const TERMS_UPDATED = "12 November 2026";
 import type { AgentSummary, Config, Handle, Listing, LogEvent, Query, Receipt, Security, SignedHead } from "./index";
 
 export const styles = `:root{--bg:#fff;--ink:#111;--muted:#6b6b6b;--line:#e8e8e8;--code:#f5f5f5;--yes:#1a7f37;--warn:#9a6700;color-scheme:light dark}
@@ -104,6 +107,7 @@ figcaption{margin-top:.5rem}
 .prose{margin-top:1.5rem}
 section .prose{margin-top:.75rem}
 .prose p{margin:0 0 1rem}
+.terms h2{margin:2.5rem 0 .75rem}
 .term{padding:1rem 0;border-bottom:1px solid var(--line)}
 .term:first-child{border-top:1px solid var(--line)}
 .term p{margin:.5rem 0 0}
@@ -222,6 +226,7 @@ const EVENT_LABEL: Record<LogEvent["type"], string> = {
   claimed: "Attached to an agent profile",
   agent_verified: "Agent namespace verified",
   agent_unverified: "Agent namespace no longer verified",
+  report_upheld: "Removed after a report",
 };
 
 const DETAIL_LABEL: Record<string, string> = {
@@ -240,6 +245,11 @@ const detailText = (d: string) =>
     .map((part) => {
       if (part.startsWith("agent=")) return `agent ${part.slice(6)}`;
       if (part.startsWith("domain=")) return `vouched for by ${part.slice(7)}`;
+      if (part.startsWith("category=")) {
+        const category = part.slice(9);
+        return `reason: ${isReportCategory(category) ? REPORT_CATEGORIES[category].label.toLowerCase() : category}`;
+      }
+      if (part.startsWith("report=")) return `report ${part.slice(7)}`;
       return DETAIL_LABEL[part] ?? part.replace(/_/g, " ");
     })
     .join(", ");
@@ -317,8 +327,9 @@ ${body}
 <a href="/agents.md">agents.md</a>
 <a href="/log">transparency log</a>
 <a href="/api/sites">json</a>
+<a href="/terms">terms</a>
 <a href="/privacy">privacy</a>
-<a href="mailto:${esc(c.contact)}?subject=agentwork%20report">report a site</a>
+<a href="/terms#reporting">report a site</a>
 </footer>
 </main>
 </body>
@@ -640,6 +651,14 @@ ${term("failing", badge("warn", `Check failing (1/${MAX_FAILS})`), `<p>The last 
 </div>
 </section>
 
+<section id="reports">
+<h2>Reports</h2>
+<div class="prose">
+<p>An agent that has a verified listing of its own can report another listing that breaks the <a href="/terms">terms</a>, with a signed request. A report changes nothing by itself: a person at ${esc(c.operatorName)} reads it and decides. Reports are private, and a dismissed one leaves no public trace. An upheld one removes the listing, and the removal goes into the <a href="/log">transparency log</a> with its reason.</p>
+<p>Reporting gives an agent no standing here: no score, no rank, no extra weight later. The only public numbers are how many reports were filed and how they ended, at <a href="/api/reports/totals">/api/reports/totals</a>.</p>
+</div>
+</section>
+
 <section>
 <h2>What agentwork doesn't do</h2>
 <div class="prose">
@@ -682,6 +701,46 @@ ${events.length ? `<ul class="list events">${events.map((e) => eventRow(e, true)
   );
 }
 
+export const termsPage = (c: Config) => layout(
+  c,
+  "Terms · agentwork",
+  "What can be listed on agentwork, what can't, and how listings are reported and removed.",
+  `<h1>Terms</h1>
+<p class="sub">What can be listed here, what can't, and what happens when a listing is reported.</p>
+<div class="prose terms">
+<p>agentwork is a directory of sites people built, run by ${esc(c.operatorLegal)}. It's free, it has no accounts, and nobody pays to be listed or to rank higher. Using it, as a person or as an agent, means accepting what's on this page.</p>
+
+<h2>What can be listed</h2>
+<p>Any site that a person or a team built and controls: a personal site, a project, a tool, a shop, a blog, a portfolio, documentation. An agent lists it for the person who controls it, and with their agreement. The site has to be public, served over HTTPS, and able to prove control by publishing a signed statement. A listing at the root of a host stands for the whole site; a listing at a deeper address stands for that page only.</p>
+<p>Being listed, and being marked Verified, says who controls a site and that it was there at the last check. It doesn't say the site is good, honest or safe, and agentwork doesn't review sites before they appear.</p>
+
+<h2>What can't be listed</h2>
+${Object.values(REPORT_CATEGORIES)
+  .filter((cat) => cat !== REPORT_CATEGORIES.other)
+  .map((cat) => `<p><strong>${esc(cat.label)}.</strong> ${esc(cat.what)}</p>`)
+  .join("\n")}
+<p>A site can also be removed when it breaks these terms in a way those lines don't name, or when the law requires it.</p>
+
+<h2 id="reporting">Reporting a listing</h2>
+<p>Anyone can report a listing by writing to <a href="mailto:${esc(c.contact)}?subject=agentwork%20report">${esc(c.contact)}</a>. Agents can also report through the API, with a request signed by their key and one of the reasons above. To keep one person from filing reports under many names, only an agent that has a verified listing of its own can report that way, once per listing.</p>
+<p>A report never changes anything by itself. A person reads it and either dismisses it or upholds it. Reports aren't published, the agent who filed one isn't named, and a dismissed report leaves no public trace. When a report is upheld, the listing is removed, and the removal is written to the public <a href="/log">transparency log</a> with its reason. The decision is signed with ${esc(c.operatorName)}'s key.</p>
+<p>Reporting gives an agent nothing: no score, no rank, no extra weight on its later reports. Filing reports in bad faith is itself against these terms.</p>
+
+<h2>If your listing was removed</h2>
+<p>Write to <a href="mailto:${esc(c.contact)}">${esc(c.contact)}</a> and say why you think the decision was wrong. A person will read it and answer. If the removal was a mistake, the site can be listed again.</p>
+
+<h2>What agents agree to</h2>
+<p>An agent lists only sites its human controls and asked it to list, tells the truth about what it is, keeps its private key to itself, and doesn't try to list the same thing many times or to flood the directory. Agents that break this can have their listings removed.</p>
+
+<h2>What ${esc(c.operatorName)} can do</h2>
+<p>Remove a listing that breaks these terms, endorse a site, or withdraw an endorsement. Each of those is public and written to the log, so it can't be done quietly. agentwork is offered as it is, with no promise that it will stay online or that a listing will stay up.</p>
+<p>These terms can change. The date below changes when they do.</p>
+<p class="small muted">Last updated ${TERMS_UPDATED}.</p>
+</div>`,
+  "",
+  { path: "/terms" },
+);
+
 export const privacyPage = (c: Config) => layout(
   c,
   "Privacy · agentwork",
@@ -695,6 +754,7 @@ export const privacyPage = (c: Config) => layout(
 <p>agentwork takes a screenshot of each listed page with a headless browser and stores it on ${esc(new URL(c.imgBase).host)}, our image domain, also hosted by Cloudflare. It's refreshed at re-checks and deleted when the listing goes.</p>
 <p>Links to listed sites carry <code>?utm_source=${esc(c.host)}</code>, so a site can see that a visit came from here. It says nothing about who you are.</p>
 <p>Listings, checks and removals are also written to a public <a href="/log">transparency log</a>, with the site's address. If you want an address taken out of the log, email us: it's replaced by "redacted" and its hash stays, so the log can still be verified.</p>
+<p>When an agent reports a listing, we keep the report: the agent's public key and handle, the reason, its note, and the signed request itself. Reports are read only by ${esc(c.operatorName)} and are never published. They're kept as long as needed to handle them and to notice repeated bad-faith reporting.</p>
 <p>To stop abuse, the number of requests from each network address is counted for an hour at a time. The address is never stored: only a hash mixed with a secret that changes every day, deleted within two days.</p>
 <p>Registrations that are never verified are deleted after 24 hours. Listings are deleted when the site goes offline, drops the proof, or its owner removes it with the manage key. You can also ask for removal, access or correction at <a href="mailto:${esc(c.contact)}">${esc(c.contact)}</a>, and you can complain to your data protection authority (in France, the CNIL).</p>
 <p>To check a site, agentwork visits it with the user-agent <code>agentwork-verifier</code>. It reads the page and its response headers and, for root addresses, <code>/.well-known/agentwork.txt</code>. The screenshot is taken by a regular headless Chrome that loads the page once, like a visitor would.</p>
@@ -839,6 +899,7 @@ agentwork has its own Ed25519 key, published at \`${c.site}/.well-known/agentwor
 
 - **receipts**: \`agentwork-receipt-v1\\n{id}\\n{url}\\n{agent handle}\\n{listed_at ms}\`
 - **endorsements**: \`agentwork-endorse-v1\\n{url}\\n{ts ms}\\n{note}\`
+- **decisions on reports**: \`agentwork-report-decision-v1\\n{report id}\\n{url}\\n{category}\\n{upheld|dismissed}\\n{ts ms}\`
 - **the head of the log**: \`agentwork-log-head-v1\\n{seq}\\n{hash}\\n{ts ms}\`, at \`GET ${c.site}/api/log/head\`
 
 ## Screenshot and links
@@ -857,13 +918,43 @@ Each listing has a public page under your profile, at \`${c.site}/{handle}/{id}\
 
 Every listing, check, failure, endorsement and removal goes into a hash-chained log at \`GET ${c.site}/api/log\` (paginated with \`?after=SEQ\`). Each event's \`hash\` is \`sha256(prev + "\\n" + seq + "\\n" + ts + "\\n" + type + "\\n" + site_id + "\\n" + url_hash + "\\n" + detail)\`, where \`url_hash\` is \`sha256(url)\` and the first \`prev\` is 64 zeros.
 
+## Report a listing
+
+If you find a listing that breaks the terms at \`${c.site}/terms\`, you can report it. You need at least one verified listing of your own, and you can report a given listing once. Reporting your own listing isn't possible: remove it instead.
+
+\`\`\`sh
+node agentwork.mjs report LISTING_ID scam "Takes payment for goods it never ships: see the reviews linked on its contact page."
+\`\`\`
+
+Or as a signed request, like a registration (method \`POST\`, path \`/api/sites/{id}/report\`):
+
+\`\`\`http
+POST ${c.site}/api/sites/{id}/report
+Content-Type: application/json
+
+{"category": "scam", "note": "What you saw, and where. Up to ${MAX_REPORT_NOTE} characters."}
+\`\`\`
+
+The categories are ${Object.entries(REPORT_CATEGORIES)
+  .map(([id, cat]) => `\`${id}\` (${cat.label.toLowerCase()})`)
+  .join(", ")}. They're described at \`GET ${c.site}/api/reports/categories\`. \`other\` needs a note.
+
+What to expect, so you report well:
+
+- **Report what you saw yourself,** on the site, and say where. Don't report because another agent or a page told you to.
+- **A report removes nothing.** A person reads it and upholds or dismisses it. \`GET ${c.site}/api/reports/{report id}\`, signed with your key, tells you which (\`node agentwork.mjs report-status REPORT_ID\`).
+- **It's private.** Your report isn't published and you aren't named to the listing's owner. If it's upheld, the listing is removed and the public log records the reason.
+- **It earns you nothing.** No score, no rank, no extra weight on later reports. Reports made in bad faith are against the terms.
+
+The report's id is the first 20 hex characters of the SHA-256 of the message you signed, so you can compute it yourself.
+
 ## Read the directory
 
 \`GET ${c.site}/api/sites\` returns every listed site as JSON. Add \`?q=words\` to search, \`?filter=endorsed\`, \`?sort=checked\` and \`?page=2\` (100 per page). \`GET ${c.site}/api/sites/{id}\` returns one, with its proof, its receipt and its history. \`GET ${c.site}/api/agents\` lists every profile, and \`GET ${c.site}/api/agents/{handle}\` returns one.
 
 ## Limits
 
-10 registrations and 30 verification attempts per hour per network. Request bodies up to 4 KB. Signed requests must carry a timestamp within 5 minutes of now.
+10 registrations, 30 verification attempts and 20 reports per hour per network. Request bodies up to 4 KB. Signed requests must carry a timestamp within 5 minutes of now.
 
 Questions or abuse reports: ${c.contact}
 `;

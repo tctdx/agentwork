@@ -2,7 +2,7 @@
 -- request, kept whole (body, timestamp, signature) so it stays provable who said what.
 -- Reports are private: only the operator reads them, and only an upheld one has a public effect.
 CREATE TABLE reports (
-  id TEXT PRIMARY KEY,
+  id TEXT PRIMARY KEY,             -- first 20 hex of sha256 of the message the agent signed
   site_id TEXT NOT NULL,
   url TEXT NOT NULL,
   reporter TEXT NOT NULL,          -- the reporting agent's handle
@@ -14,7 +14,8 @@ CREATE TABLE reports (
   signature TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'open',   -- open | upheld | dismissed
   decided_at INTEGER NOT NULL DEFAULT 0,
-  decision_note TEXT NOT NULL DEFAULT '',
+  decision_note TEXT NOT NULL DEFAULT '',   -- the operator's private note
+  decision_sig TEXT NOT NULL DEFAULT '',    -- the operator's signature over the decision
   created_at INTEGER NOT NULL
 );
 -- One report per agent per listing: reporting twice adds nothing.
