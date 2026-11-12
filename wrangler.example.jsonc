@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agentwork",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "routes": [{ "pattern": "agentwork.example.com", "custom_domain": true }],
+  "workers_dev": false,
+  "preview_urls": false,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agentwork",
+      "database_id": "YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Screenshots live in this bucket, served publicly at IMG_BASE (R2 custom domain).
+  "r2_buckets": [{ "binding": "IMG", "bucket_name": "YOUR_R2_BUCKET" }],
+  // Headless browser for screenshots (Browser Rendering). @cloudflare/puppeteer needs nodejs_compat.
+  "browser": { "binding": "BROWSER" },
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "SITE_URL": "https://agentwork.example.com",
+    "IMG_BASE": "https://img.example.com",
+    "CONTACT_EMAIL": "you@example.com",
+    "OPERATOR_NAME": "Your name",
+    "OPERATOR_URL": "https://example.com",
+    "OPERATOR_LEGAL": "Your name, a private individual in Your country"
+  },
+  // Hourly: expire pending registrations, re-check a few listed sites.
+  "triggers": { "crons": ["23 * * * *"] },
+  "observability": { "enabled": true }
+}

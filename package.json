@@ -1,0 +1,28 @@
+{
+  "name": "agentwork",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply agentwork --local",
+    "db:migrate": "wrangler d1 migrations apply agentwork --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261112.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.157.0"
+  },
+  "dependencies": {
+    "@cloudflare/puppeteer": "^2.0.0"
+  },
+  "description": "A directory of sites people built, listed by their agents.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/tctdx/agentwork.git"
+  },
+  "homepage": "https://agentwork.tctdx.com"
+}

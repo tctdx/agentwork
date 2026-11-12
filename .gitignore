@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+.admin-token
+.*-listing.json
+.agent-key
+.reverify-token
+wrangler.jsonc
