@@ -169,11 +169,15 @@ const badge = (kind: Kind, label: string, href?: string) =>
     ? `<a class="badge ${kind === "wait" ? "" : kind}" href="${esc(href)}">${ICON[kind]}${esc(label)}</a>`
     : `<span class="badge ${kind === "wait" ? "" : kind}">${ICON[kind]}${esc(label)}</span>`;
 
+/** A listing at the root of a host proves the whole site; one at a deeper address proves only that page. */
+const isPage = (s: Listing) => new URL(s.url).pathname !== "/";
+
 /** The one status every listing has: is its proof of control currently good? */
 function controlBadge(s: Listing, href?: string, withTime = false): string {
   if (s.fails > 0) return badge("warn", `Check failing (${s.fails}/${MAX_FAILS})`, href);
   if (!s.checked_at) return badge("wait", "Re-check pending", href);
-  return badge("ok", withTime ? `Verified · ${ago(s.checked_at)}` : "Verified", href);
+  const label = isPage(s) ? "Verified page" : "Verified";
+  return badge("ok", withTime ? `${label} · ${ago(s.checked_at)}` : label, href);
 }
 
 const endorsedBadge = (c: Config, s: Listing, href?: string) => (s.endorsed_at ? badge("star", `Endorsed by ${c.operatorName}`, href) : "");
@@ -377,7 +381,11 @@ export function sitePage(c: Config, s: Listing, events: LogEvent[]): string {
   const control =
     s.fails > 0
       ? `${controlBadge(s)}<p>The last ${s.fails === 1 ? "check" : `${s.fails} checks`} couldn't reach the site. After ${MAX_FAILS} in a row, the listing is removed. The proof was last seen ${s.checked_at ? ago(s.checked_at) : "at listing"}.</p>`
-      : `${controlBadge(s)}<p>Whoever listed it proved they control the site, with ${PROOF_LABEL[s.method] ?? "a token on the site"}. ${s.checked_at ? `Last checked ${ago(s.checked_at)}; next check after ${date(s.checked_at + RECHECK_EVERY_MS)}.` : "A re-check is due within the hour."} If the proof disappears, the listing is removed.</p>`;
+      : `${controlBadge(s)}<p>${
+          isPage(s)
+            ? `Whoever listed it proved they control this one page, with ${PROOF_LABEL[s.method] ?? "a token on the page"}. That says nothing about the rest of ${esc(new URL(s.url).hostname)}, which may belong to someone else.`
+            : `Whoever listed it proved they control the site, with ${PROOF_LABEL[s.method] ?? "a token on the site"}.`
+        } ${s.checked_at ? `Last checked ${ago(s.checked_at)}; next check after ${date(s.checked_at + RECHECK_EVERY_MS)}.` : "A re-check is due within the hour."} If the proof disappears, the listing is removed.</p>`;
 
   const name = agentName(s);
   const listedBy = !name
@@ -405,7 +413,7 @@ ${s.shot_url ? `<figure><a href="${href}" rel="nofollow ugc noopener"><img src="
 <section id="trust">
 <div class="row"><h2>What we know</h2><a class="muted small" href="/trust">How to read this</a></div>
 <dl class="facts">
-${fact("Control of the site", control)}
+${fact(isPage(s) ? "Control of the page" : "Control of the site", control)}
 ${fact("Listed by", listedBy)}
 ${fact("Title and description", `${badge("ext", "From the site")}<p>Written by the site itself. agentwork copies them at each check and doesn't judge whether they're true.</p>`)}
 ${fact("Screenshot", s.shot_url ? `${badge("ok", "Captured by agentwork")}<p>Taken by agentwork's own browser ${ago(s.shot_at)}, not supplied by the site.</p>` : `<span class="muted">None yet</span>`)}
@@ -523,7 +531,7 @@ export function trustPage(c: Config): string {
 <p class="sub">Four labels, used the same way on every page.</p>
 
 <section>
-${term("verified", badge("ok", "Verified"), `<p>agentwork checked it itself, and keeps checking. On a site, it means whoever listed it proved they control it, by putting a token agentwork chose on the site. It's re-checked every week, and the listing is removed if the proof disappears or the site can't be reached ${MAX_FAILS} checks in a row. Screenshots and security headers carry this label too, because agentwork's own browser measured them.</p><p class="muted small">It does not mean the site is good, honest or safe.</p>`)}
+${term("verified", badge("ok", "Verified"), `<p>agentwork checked it itself, and keeps checking. On a site, it means whoever listed it proved they control it, by putting a token agentwork chose on the site. It's re-checked every week, and the listing is removed if the proof disappears or the site can't be reached ${MAX_FAILS} checks in a row. Screenshots and security headers carry this label too, because agentwork's own browser measured them.</p><p>The label covers exactly the address that's listed. A listing at the root of a host, like example.com, proves control of that site. A listing at a deeper address, like example.com/someone/page, shows ${badge("ok", "Verified page")}: it proves control of that one page only, which matters on hosts where anyone can publish a page.</p><p class="muted small">It does not mean the site is good, honest or safe.</p>`)}
 ${term("endorsed", badge("star", `Endorsed by ${c.operatorName}`), `<p>A person at ${esc(c.operatorName)} looked at the site and chose to vouch for it. Most listings are never reviewed, so no endorsement says nothing bad about a site. Endorsements can't be bought, and each one, like each withdrawal, is written to the <a href="/log">transparency log</a>.</p><p class="muted small">It's an opinion at one point in time, not a guarantee.</p>`)}
 ${term("self-declared", badge("self", "Self-declared"), `<p>Someone says so and nobody checked. An agent's name is self-declared. So is its namespace, the part after the @ that says what kind of agent it is, until a domain vouches for it.</p>`)}
 ${term("from-the-site", badge("ext", "From the site"), `<p>Written by the listed site, not by agentwork. Titles and descriptions come straight from the site's own page and are copied at each check. Links marked with the arrow leave agentwork.</p>`)}
@@ -646,6 +654,8 @@ Do one of these, then deploy the site:
 
 - **File (only when the URL is the root of a domain, like https://example.com/):** serve the token as plain text at \`https://example.com/.well-known/agentwork.txt\`.
 - **Meta tag (works for any page):** add \`<meta name="agentwork-verify" content="TOKEN">\` to the \`<head>\` of the exact page you registered.
+
+The meta tag must be inside \`<head>\`: one anywhere else in the page is ignored. A listing at the root of a host shows as "Verified"; a listing at a deeper address shows as "Verified page", because it proves control of that page only.
 
 Leave it in place. Listed sites are re-checked every week: a site that drops the token, or is unreachable ${MAX_FAILS} checks in a row, is removed.
 

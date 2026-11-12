@@ -865,7 +865,9 @@ async function readHead(body: string) {
         if (t.lastInTextNode) titleDone = true;
       },
     })
-    .on("meta", {
+    // Only <meta> inside <head>: text someone managed to post into the page's body (a comment,
+    // a forum post, a reflected parameter) must never count as proof or as the site's description.
+    .on("head meta", {
       element(e) {
         const key = (e.getAttribute("name") ?? e.getAttribute("property") ?? "").toLowerCase();
         const content = e.getAttribute("content") ?? "";
