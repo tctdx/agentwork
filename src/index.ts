@@ -42,7 +42,7 @@ import {
   verifySignature,
   type Statement,
 } from "./crypto";
-import { GENESIS, MAX_FAILS, PAGE_SIZE, RECHECK_EVERY_MS } from "./constants";
+import { GENESIS, MAX_FAILS, PAGE_SIZE, RECHECK_EVERY_MS, sitePath } from "./constants";
 import { DNS_LABEL, lookupTxt } from "./dns";
 import { agentPage, agentsIndexPage, agentsMd, homePage, logPage, notFoundPage, privacyPage, sitePage, styles, trustPage } from "./pages";
 
@@ -129,6 +129,8 @@ export interface Listing {
   endorse_sig: string;
   /** Domain that vouches for the agent's namespace, when verified. */
   agent_domain: string | null;
+  /** The listing's page on the directory. */
+  page: string;
 }
 
 export interface Query {
@@ -201,9 +203,15 @@ export default {
     try {
       if (path.startsWith("/api/")) return withCors(await api(request, env, ctx, path, url));
       if (request.method !== "GET" && request.method !== "HEAD") return text("Method not allowed", 405);
-      if (path.startsWith("/site/")) {
-        const site = await listing(env, path.slice(6));
+      // A listing's address names its agent: /<handle>/<id>. The older /site/<id> redirects there.
+      const nested = path.startsWith("/site/") ? null : /^\/([^/]+)\/([0-9a-f]{20})$/.exec(path);
+      if (nested || path.startsWith("/site/")) {
+        const site = await listing(env, nested ? nested[2] : path.slice(6));
         if (!site) return html(c, notFoundPage(c), 404);
+        if (path !== sitePath(site)) {
+          if (nested) return html(c, notFoundPage(c), 404);
+          return new Response(null, { status: 308, headers: { location: sitePath(site) } });
+        }
         return html(c, sitePage(c, site, await siteEvents(env, site.id), await receiptFor(env, site)));
       }
       const handle = parseHandle(safeDecode(path.slice(1)));
@@ -227,8 +235,8 @@ export default {
         case "/.well-known/agentwork-operator.json":
           return json({ alg: "Ed25519", key: (await operator(env.OPERATOR_SIGNING_KEY)).publicKey, signs: ["log head", "listing receipts", "endorsements"], formats: `${c.site}/agents.md` });
         case "/random": {
-          const pick = await env.DB.prepare("SELECT id FROM sites WHERE status = 'listed' ORDER BY RANDOM() LIMIT 1").first<{ id: string }>();
-          return new Response(null, { status: 302, headers: { location: pick ? `/site/${pick.id}` : "/", "cache-control": "no-store" } });
+          const pick = await env.DB.prepare("SELECT id, agent_id FROM sites WHERE status = 'listed' ORDER BY RANDOM() LIMIT 1").first<{ id: string; agent_id: string }>();
+          return new Response(null, { status: 302, headers: { location: pick ? sitePath(pick) : "/", "cache-control": "no-store" } });
         }
         case "/log":
           return html(c, logPage(c, await recentEvents(env, 100), await signedHead(env)));
@@ -392,16 +400,18 @@ async function register(request: Request, env: Env): Promise<Response> {
   if ((pending?.n ?? 0) >= MAX_PENDING) return apiError(503, "busy", "Too many pending registrations right now. Try again later.");
   const existing = await env.DB.prepare("SELECT agent_id FROM sites WHERE url = ? AND status = 'listed'").bind(target.href).first<{ agent_id: string }>();
 
-  const id = randomId(12);
+  // A listing's id is the fingerprint of the statement its site will publish: anyone holding the
+  // proof can recompute it. The random challenge inside makes every registration's id unique.
+  const c = config(env);
   const challenge = randomHex(16);
+  const statement: Statement = { aud: c.host, url: target.href, challenge, agent: who.handle, key: who.key };
+  const id = (await sha256Hex(proofToSign(statement))).slice(0, HANDLE_HASH_LENGTH);
   await env.DB.prepare(
     "INSERT INTO sites (id, url, host, agent, agent_id, agent_pub, token, manage_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', 'pending', ?)",
   )
     .bind(id, target.href, target.hostname, agent, who.handle, who.key, challenge, Date.now())
     .run();
 
-  const c = config(env);
-  const statement: Statement = { aud: c.host, url: target.href, challenge, agent: who.handle, key: who.key };
   const atRoot = target.pathname === "/";
   return json(
     {
@@ -433,7 +443,7 @@ async function verify(request: Request, env: Env, ctx: ExecutionContext, id: str
   const c = config(env);
   const row = await env.DB.prepare(`SELECT ${CHECK_COLUMNS}, status FROM sites WHERE id = ?`).bind(id).first<CheckRow & { status: string }>();
   if (!row) return apiError(404, "not_found", "No registration with this id. Pending ones expire after 24 hours.");
-  if (row.status === "listed") return json({ id, status: "listed", url: row.url, page: `${c.site}/site/${id}` });
+  if (row.status === "listed") return json({ id, status: "listed", url: row.url, page: c.site + sitePath({ id, agent_id: row.agent_id }) });
 
   const check = await checkSite(env, new URL(row.url), row);
   if (!check.ok) return apiError(422, check.reason, check.message);
@@ -469,7 +479,7 @@ async function verify(request: Request, env: Env, ctx: ExecutionContext, id: str
     proof: check.method,
     agent: { handle: row.agent_id, profile: `${c.site}/${row.agent_id}` },
     security: check.security,
-    page: `${c.site}/site/${id}`,
+    page: c.site + sitePath({ id, agent_id: row.agent_id }),
     ...(op
       ? {
           receipt: {
@@ -1081,13 +1091,13 @@ function clip(s: string, max: number): string {
 
 const bare = (h: string) => h.toLowerCase().replace(/^www\./, "");
 
-type ListingRow = Omit<Listing, "security" | "shot_url"> & { security: string; shot: string };
+type ListingRow = Omit<Listing, "security" | "shot_url" | "page"> & { security: string; shot: string };
 const toListing = (env: Env, { shot, ...r }: ListingRow): Listing => {
   let security: Security | null = null;
   try {
     security = r.security ? (JSON.parse(r.security) as Security) : null;
   } catch {}
-  return { ...r, security, shot_url: shot ? `${config(env).imgBase}/${shot}` : null };
+  return { ...r, security, shot_url: shot ? `${config(env).imgBase}/${shot}` : null, page: config(env).site + sitePath(r) };
 };
 
 async function listed(env: Env, limit: number): Promise<Listing[]> {
@@ -1151,11 +1161,6 @@ function safeEqual(a: string, b: string): boolean {
 
 function randomHex(bytes: number): string {
   return [...crypto.getRandomValues(new Uint8Array(bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function randomId(len: number): string {
-  const alphabet = "abcdefghijkmnpqrstuvwxyz23456789";
-  return [...crypto.getRandomValues(new Uint8Array(len))].map((b) => alphabet[b % alphabet.length]).join("");
 }
 
 const SECURITY_HEADERS = {
