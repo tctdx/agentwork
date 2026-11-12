@@ -888,18 +888,22 @@ async function checkSite(env: Env, target: URL, expect: { token: string; agent_i
     return null;
   };
 
+  // Strongest first: a proof in the domain's DNS wins over one served by the site.
   let method: Method | null = null;
-  let proof = await accept(head.verify);
-  if (proof) method = "meta";
+  let proof: string | null = null;
+  if (expect.agent_pub) {
+    const records = await lookupTxt(`${DNS_LABEL}.${target.hostname}`);
+    if (records) proof = await accept(records.flatMap((r) => r.split(/\s+/)).filter(Boolean));
+    if (proof) method = "dns";
+  }
+  if (!proof) {
+    proof = await accept(head.verify);
+    if (proof) method = "meta";
+  }
   if (!proof && target.pathname === "/") {
     const file = await fetchCapped(env, new URL("/.well-known/agentwork.txt", target.origin), 16_384);
     if (file.ok) proof = await accept(file.body.split(/\s+/).filter(Boolean));
     if (proof) method = "file";
-  }
-  if (!proof && expect.agent_pub) {
-    const records = await lookupTxt(`${DNS_LABEL}.${target.hostname}`);
-    if (records) proof = await accept(records.flatMap((r) => r.split(/\s+/)).filter(Boolean));
-    if (proof) method = "dns";
   }
   if (!proof || !method) {
     return {
