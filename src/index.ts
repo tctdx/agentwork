@@ -15,14 +15,33 @@
  * Screenshots: a headless browser (Browser Rendering) captures each listed page at its final
  * size and stores it in the R2 bucket served at IMG_BASE. No image transforms.
  *
- * Agent profiles: an agent can list sites under a profile, /<hash>@<vendor>. The hash is derived
- * from a secret key only the agent holds, so every site on a profile was listed with the same key.
- * The vendor (com.anthropic.claude, …) is self-declared and shown as such: it can't be verified.
+ * Signatures (see crypto.ts): an agent is an Ed25519 key. It signs its requests, and the proof a
+ * site publishes is a statement signed with that key, so anyone can check a listing without
+ * trusting this server. The operator has its own key and signs receipts, endorsements and the
+ * head of the log. An agent's profile, /<hash>@<namespace>, is a fingerprint of its public key;
+ * the namespace is self-declared until the domain behind it publishes that fingerprint.
  *
  * A trusted process holding REVERIFY_TOKEN can re-verify any listing on demand
  * (POST /api/sites/:id/reverify): same check as the weekly one, plus a fresh screenshot.
  */
 import puppeteer from "@cloudflare/puppeteer";
+import clientScript from "./client.mjs.txt";
+import {
+  agentHandle,
+  endorseMessage,
+  HANDLE_HASH_LENGTH,
+  isPublicKey,
+  logHeadMessage,
+  operator,
+  PROOF_PREFIX,
+  proofToSign,
+  readProof,
+  receiptMessage,
+  requestMessage,
+  sha256Hex,
+  verifySignature,
+  type Statement,
+} from "./crypto";
 import { GENESIS, MAX_FAILS, PAGE_SIZE, RECHECK_EVERY_MS } from "./constants";
 import { agentPage, agentsIndexPage, agentsMd, homePage, logPage, notFoundPage, privacyPage, sitePage, styles, trustPage } from "./pages";
 
@@ -41,6 +60,8 @@ export interface Env {
   /** Who runs it, for the privacy page, e.g. "Jane Doe, a private individual in France". */
   OPERATOR_LEGAL: string;
   HASH_SALT: string;
+  /** The operator's Ed25519 private key, PKCS#8 in base64. Its public half is published. */
+  OPERATOR_SIGNING_KEY: string;
   ADMIN_TOKEN: string;
   REVERIFY_TOKEN: string;
 }
@@ -88,6 +109,11 @@ export interface Listing {
   description: string;
   agent: string;
   agent_id: string;
+  /** The agent's Ed25519 public key. Empty on listings made before signatures. */
+  agent_pub: string;
+  /** The signed statement found on the site at the last check. */
+  proof: string;
+  challenge: string;
   method: string;
   security: Security | null;
   listed_at: number;
@@ -99,6 +125,7 @@ export interface Listing {
   /** Set when a human at the operator reviewed the listing. */
   endorsed_at: number;
   endorse_note: string;
+  endorse_sig: string;
   /** Domain that vouches for the agent's namespace, when verified. */
   agent_domain: string | null;
 }
@@ -157,10 +184,11 @@ const LIMITS = {
 } as const;
 const userAgent = (env: Env) => `agentwork-verifier/1.0 (+${config(env).site}/agents.md)`;
 const LISTING_COLUMNS =
-  "id, url, host, title, description, agent, agent_id, method, security, listed_at, checked_at, fails, shot, shot_at, endorsed_at, endorse_note, " +
+  "id, url, host, title, description, agent, agent_id, agent_pub, proof, token AS challenge, method, security, listed_at, checked_at, fails, shot, shot_at, endorsed_at, endorse_note, endorse_sig, " +
   "(SELECT domain FROM agents a WHERE a.handle = sites.agent_id AND a.verified_at > 0) AS agent_domain";
 const AGENT_RECHECK_PER_RUN = 5;
 const AGENTS_FILE = "/.well-known/agentwork-agents.txt";
+const SIGNATURE_WINDOW_S = 300;
 
 const enc = new TextEncoder();
 
@@ -175,7 +203,7 @@ export default {
       if (path.startsWith("/site/")) {
         const site = await listing(env, path.slice(6));
         if (!site) return html(c, notFoundPage(c), 404);
-        return html(c, sitePage(c, site, await siteEvents(env, site.id)));
+        return html(c, sitePage(c, site, await siteEvents(env, site.id), await receiptFor(env, site)));
       }
       const handle = parseHandle(safeDecode(path.slice(1)));
       if (handle) {
@@ -192,13 +220,17 @@ export default {
         case "/agents":
           return html(c, agentsIndexPage(c, await agentSummaries(env)));
         case "/trust":
-          return html(c, trustPage(c));
+          return html(c, trustPage(c, (await operator(env.OPERATOR_SIGNING_KEY)).publicKey));
+        case "/agentwork.mjs":
+          return text(clientScript.replace("__SITE__", c.site), 200, "text/javascript; charset=utf-8");
+        case "/.well-known/agentwork-operator.json":
+          return json({ alg: "Ed25519", key: (await operator(env.OPERATOR_SIGNING_KEY)).publicKey, signs: ["log head", "listing receipts", "endorsements"], formats: `${c.site}/agents.md` });
         case "/random": {
           const pick = await env.DB.prepare("SELECT id FROM sites WHERE status = 'listed' ORDER BY RANDOM() LIMIT 1").first<{ id: string }>();
           return new Response(null, { status: 302, headers: { location: pick ? `/site/${pick.id}` : "/", "cache-control": "no-store" } });
         }
         case "/log":
-          return html(c, logPage(c, await recentEvents(env, 100)));
+          return html(c, logPage(c, await recentEvents(env, 100), await signedHead(env)));
         case "/agents.md":
         case "/llms.txt":
           return text(agentsMd(c), 200, "text/markdown; charset=utf-8");
@@ -225,7 +257,7 @@ export default {
     ]);
     // Re-check the listings that were checked longest ago.
     const { results } = await env.DB.prepare(
-      "SELECT id, url, token, fails, shot, shot_at FROM sites WHERE status = 'listed' AND checked_at < ? ORDER BY checked_at LIMIT ?",
+      `SELECT ${CHECK_COLUMNS} FROM sites WHERE status = 'listed' AND checked_at < ? ORDER BY checked_at LIMIT ?`,
     )
       .bind(now - RECHECK_EVERY_MS, RECHECK_PER_RUN)
       .all<CheckRow>();
@@ -257,15 +289,15 @@ async function api(request: Request, env: Env, ctx: ExecutionContext, path: stri
     const after = Math.max(0, Number.parseInt(url.searchParams.get("after") ?? "0", 10) || 0);
     const limit = Math.min(1000, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "500", 10) || 500));
     const { results } = await env.DB.prepare("SELECT * FROM log WHERE seq > ? ORDER BY seq LIMIT ?").bind(after, limit).all<LogEvent>();
-    const head = await env.DB.prepare("SELECT seq, hash FROM log ORDER BY seq DESC LIMIT 1").first<{ seq: number; hash: string }>();
     return json({
-      head: head ?? { seq: 0, hash: GENESIS },
+      head: await signedHead(env),
       hash_rule: "sha256(prev + '\\n' + seq + '\\n' + ts + '\\n' + type + '\\n' + site_id + '\\n' + url_hash + '\\n' + detail), url_hash = sha256(url), first prev = 64 zeros",
       events: results,
       next: results.length === limit ? `/api/log?after=${results[results.length - 1].seq}&limit=${limit}` : null,
     });
   }
 
+  if (parts[0] === "log" && parts[1] === "head" && parts.length === 2 && request.method === "GET") return json(await signedHead(env));
   if (parts[0] === "agents" && parts.length === 1 && request.method === "GET") return json({ agents: await agentSummaries(env) });
   if (parts[0] === "agents" && parts[1] === "whoami" && parts.length === 2 && request.method === "POST") return whoami(request, env);
   if (parts[0] === "agents" && parts.length === 3 && parts[2] === "verify" && request.method === "POST") {
@@ -289,6 +321,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext, path: stri
       agent: handle.id,
       hash: handle.hash,
       namespace: handle.vendor,
+      key: sites[0].agent_pub,
       namespace_verified: !!domain,
       ...(domain ? { namespace_domain: domain } : {}),
       profile: `${config(env).site}/${handle.id}`,
@@ -309,64 +342,85 @@ async function api(request: Request, env: Env, ctx: ExecutionContext, path: stri
   if (!id && request.method === "POST") return register(request, env);
   if (id && parts[2] === "verify" && request.method === "POST") return verify(request, env, ctx, id);
   if (id && parts[2] === "reverify" && request.method === "POST") return reverify(request, env, id);
-  if (id && parts[2] === "claim" && request.method === "POST") return claim(request, env, id);
   if (id && parts[2] === "endorse" && (request.method === "POST" || request.method === "DELETE")) return endorse(request, env, id);
   if (id && !parts[2] && request.method === "GET") return status(env, id);
   if (id && !parts[2] && request.method === "DELETE") return remove(request, env, id);
   return apiError(405, "method_not_allowed", `Wrong method for this endpoint. See ${config(env).site}/agents.md`);
 }
 
+/** Who signed this request. The signature covers the method, the path, a timestamp and the body. */
+interface Signer {
+  key: string;
+  namespace: string;
+  handle: string;
+}
+
+async function signer(request: Request, raw: string): Promise<Signer | Response> {
+  const h = request.headers;
+  const key = h.get("x-agent-key") ?? "";
+  const namespace = cleanVendor(h.get("x-agent-namespace"));
+  const timestamp = h.get("x-agent-timestamp") ?? "";
+  const signature = h.get("x-agent-signature") ?? "";
+  const how = "Sign requests with your Ed25519 key: see the agents.md instructions.";
+  if (!key && !signature) return apiError(401, "unsigned", `This request must be signed. ${how}`);
+  if (!isPublicKey(key)) return apiError(400, "bad_key", `X-Agent-Key must be a 32-byte Ed25519 public key in base64url. ${how}`);
+  if (!namespace) return apiError(400, "bad_namespace", "X-Agent-Namespace must be a reverse-DNS id like com.example.agents.");
+  if (!/^\d{9,11}$/.test(timestamp) || Math.abs(Date.now() / 1000 - Number(timestamp)) > SIGNATURE_WINDOW_S) {
+    return apiError(401, "bad_timestamp", `X-Agent-Timestamp must be the current time in unix seconds (within ${SIGNATURE_WINDOW_S} s).`);
+  }
+  const message = requestMessage(request.method, new URL(request.url).pathname, timestamp, await sha256Hex(raw));
+  if (!(await verifySignature(key, signature, message))) {
+    return apiError(401, "bad_signature", "The signature doesn't match. Sign exactly: agentwork-request-v1\\nMETHOD\\n/path\\ntimestamp\\nsha256-hex-of-body");
+  }
+  return { key, namespace, handle: await agentHandle(namespace, key) };
+}
+
 async function register(request: Request, env: Env): Promise<Response> {
   if (await limited(request, env, "register")) return apiError(429, "rate_limited", "Too many registrations from here. Try again in an hour.");
 
-  const body = await readJson(request);
+  const raw = await request.text();
+  const who = await signer(request, raw);
+  if (who instanceof Response) return who;
+  const body = parseJson(raw);
   if (!body) return apiError(400, "bad_json", 'Send a JSON body like {"url": "https://example.com/"}.');
   const target = normalizeUrl(body.url);
   if (!target) return apiError(400, "bad_url", "url must be a public https:// address (no IPs, ports or localhost).");
   const agent = cleanAgent(body.agent);
-  let agentId = "";
-  if (body.agent_key !== undefined || body.agent_vendor !== undefined || body.agent_namespace !== undefined) {
-    const identity = await identityOf(body);
-    if (identity instanceof Response) return identity;
-    agentId = identity;
-  }
-
-  const existing = await env.DB.prepare("SELECT id FROM sites WHERE url = ? AND status = 'listed'").bind(target.href).first();
-  if (existing) return apiError(409, "already_listed", "This URL is already listed.");
 
   const pending = await env.DB.prepare("SELECT COUNT(*) AS n FROM sites WHERE status = 'pending'").first<{ n: number }>();
   if ((pending?.n ?? 0) >= MAX_PENDING) return apiError(503, "busy", "Too many pending registrations right now. Try again later.");
+  const existing = await env.DB.prepare("SELECT agent_id FROM sites WHERE url = ? AND status = 'listed'").bind(target.href).first<{ agent_id: string }>();
 
   const id = randomId(12);
-  const token = `aw_${randomHex(16)}`;
-  const manageKey = `awm_${randomHex(24)}`;
+  const challenge = randomHex(16);
   await env.DB.prepare(
-    "INSERT INTO sites (id, url, host, agent, agent_id, token, manage_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+    "INSERT INTO sites (id, url, host, agent, agent_id, agent_pub, token, manage_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', 'pending', ?)",
   )
-    .bind(id, target.href, target.hostname, agent, agentId, token, await sha256(manageKey), Date.now())
+    .bind(id, target.href, target.hostname, agent, who.handle, who.key, challenge, Date.now())
     .run();
 
+  const c = config(env);
+  const statement: Statement = { url: target.href, challenge, agent: who.handle, key: who.key };
   const atRoot = target.pathname === "/";
   return json(
     {
       id,
       url: target.href,
       status: "pending",
-      ...(agentId
-        ? { agent_profile: { handle: agentId, url: `${config(env).site}/${agentId}`, note: "Appears once this site is listed. If this handle isn't the one you stored, you used a different key or namespace: stop and fix that first." } }
-        : {}),
-      token,
-      manage_key: manageKey,
-      expires_in_hours: 24,
-      prove_control: {
-        ...(atRoot ? { file: { url: `${target.origin}/.well-known/agentwork.txt`, content: token } } : {}),
-        meta: `<meta name="agentwork-verify" content="${token}">`,
+      agent: { handle: who.handle, profile: `${c.site}/${who.handle}` },
+      statement,
+      to_sign: proofToSign(statement),
+      proof_token: "to_sign + '.' + base64url(Ed25519 signature of to_sign, made with your key)",
+      publish: {
+        ...(atRoot ? { file: `${target.origin}/.well-known/agentwork.txt` } : {}),
+        meta: '<meta name="agentwork-verify" content="PROOF_TOKEN">  (inside <head>)',
         note: atRoot
-          ? "Do one of the two, deploy, then call verify. Keep the token in place: listings are re-checked."
+          ? "Publish the proof token one of the two ways, deploy, then call verify. Keep it in place: listings are re-checked."
           : "Put the meta tag in the <head> of this exact page, deploy, then call verify. Keep it in place: listings are re-checked.",
       },
-      verify: { method: "POST", url: `${config(env).site}/api/sites/${id}/verify` },
-      manage_key_note: "Shown once. Give it to your human or store it privately: it's the only way to remove the listing.",
+      verify: { method: "POST", url: `${c.site}/api/sites/${id}/verify` },
+      expires_in_hours: 24,
+      ...(existing ? { replaces: `This address is already listed${existing.agent_id ? ` by ${existing.agent_id}` : ""}. If the site publishes your proof, your listing replaces it: the site decides.` } : {}),
     },
     201,
   );
@@ -374,29 +428,36 @@ async function register(request: Request, env: Env): Promise<Response> {
 
 async function verify(request: Request, env: Env, ctx: ExecutionContext, id: string): Promise<Response> {
   if (await limited(request, env, "verify")) return apiError(429, "rate_limited", "Too many verification attempts from here. Try again in an hour.");
-  const row = await env.DB.prepare("SELECT url, token, status, agent_id FROM sites WHERE id = ?")
-    .bind(id)
-    .first<{ url: string; token: string; status: string; agent_id: string }>();
+  const c = config(env);
+  const row = await env.DB.prepare(`SELECT ${CHECK_COLUMNS}, status FROM sites WHERE id = ?`).bind(id).first<CheckRow & { status: string }>();
   if (!row) return apiError(404, "not_found", "No registration with this id. Pending ones expire after 24 hours.");
-  if (row.status === "listed") return json({ id, status: "listed", url: row.url, page: `${config(env).site}/site/${id}` });
+  if (row.status === "listed") return json({ id, status: "listed", url: row.url, page: `${c.site}/site/${id}` });
 
-  const check = await checkSite(env, new URL(row.url), row.token);
+  const check = await checkSite(env, new URL(row.url), row);
   if (!check.ok) return apiError(422, check.reason, check.message);
 
+  // The site now vouches for this key. A listing of the same address by another key gives way.
+  const old = await env.DB.prepare("SELECT id, shot FROM sites WHERE url = ? AND status = 'listed' AND id != ?").bind(row.url, id).first<{ id: string; shot: string }>();
+  if (old) {
+    await env.DB.prepare("DELETE FROM sites WHERE id = ?").bind(old.id).run();
+    await dropShot(env, old.shot);
+    await appendLog(env, "removed", old.id, row.url, `superseded; agent=${row.agent_id}`);
+  }
   const now = Date.now();
   try {
     await env.DB.prepare(
-      "UPDATE sites SET status = 'listed', title = ?, description = ?, method = ?, security = ?, listed_at = ?, checked_at = ?, fails = 0 WHERE id = ?",
+      "UPDATE sites SET status = 'listed', title = ?, description = ?, method = ?, proof = ?, security = ?, listed_at = ?, checked_at = ?, fails = 0 WHERE id = ?",
     )
-      .bind(check.title, check.description, check.method, JSON.stringify(check.security), now, now, id)
+      .bind(check.title, check.description, check.method, check.proof, JSON.stringify(check.security), now, now, id)
       .run();
   } catch {
     return apiError(409, "already_listed", "This URL was listed by another registration in the meantime.");
   }
   await env.DB.prepare("DELETE FROM sites WHERE url = ? AND status = 'pending'").bind(row.url).run();
-  await appendLog(env, "listed", id, row.url, `proof=${check.method}${row.agent_id ? `; agent=${row.agent_id}` : ""}`);
+  await appendLog(env, "listed", id, row.url, `proof=${check.method}; agent=${row.agent_id}`);
   // The screenshot takes a few seconds: don't make the agent wait for it.
   ctx.waitUntil(captureShot(env, { id, url: row.url, shot: "" }));
+  const op = await operator(env.OPERATOR_SIGNING_KEY);
   return json({
     id,
     status: "listed",
@@ -404,9 +465,15 @@ async function verify(request: Request, env: Env, ctx: ExecutionContext, id: str
     title: check.title,
     description: check.description,
     proof: check.method,
-    ...(row.agent_id ? { agent_profile: `${config(env).site}/${row.agent_id}` } : {}),
+    agent: { handle: row.agent_id, profile: `${c.site}/${row.agent_id}` },
     security: check.security,
-    page: `${config(env).site}/site/${id}`,
+    page: `${c.site}/site/${id}`,
+    receipt: {
+      statement: receiptMessage(id, row.url, row.agent_id, now),
+      signature: await op.sign(receiptMessage(id, row.url, row.agent_id, now)),
+      operator_key: op.publicKey,
+      note: "Signed by the directory. Keep it: it proves this listing was accepted, whatever happens to the server.",
+    },
     screenshot: "A screenshot of the page is being taken and will show on the listing shortly.",
   });
 }
@@ -417,7 +484,7 @@ async function reverify(request: Request, env: Env, id: string): Promise<Respons
   if (!env.REVERIFY_TOKEN || !key || !safeEqual(key, env.REVERIFY_TOKEN)) {
     return apiError(401, "unauthorized", "This endpoint is for the trusted re-verification process.");
   }
-  const row = await env.DB.prepare("SELECT id, url, token, fails, shot, shot_at FROM sites WHERE id = ? AND status = 'listed'")
+  const row = await env.DB.prepare(`SELECT ${CHECK_COLUMNS} FROM sites WHERE id = ? AND status = 'listed'`)
     .bind(id)
     .first<CheckRow>();
   if (!row) return apiError(404, "not_found", "No listed site with this id.");
@@ -433,7 +500,8 @@ async function reverify(request: Request, env: Env, id: string): Promise<Respons
   });
 }
 
-type CheckRow = { id: string; url: string; token: string; fails: number; shot: string; shot_at: number };
+const CHECK_COLUMNS = "id, url, token, agent_id, agent_pub, fails, shot, shot_at";
+type CheckRow = { id: string; url: string; token: string; agent_id: string; agent_pub: string; fails: number; shot: string; shot_at: number };
 type Outcome =
   | { result: "checked"; detail: string; security: Security }
   | { result: "check_failed" | "delisted"; detail: string };
@@ -442,10 +510,10 @@ type Outcome =
 async function recheck(env: Env, row: CheckRow, by: "schedule" | "trusted"): Promise<Outcome> {
   const now = Date.now();
   const tag = by === "trusted" ? "; by=trusted" : "";
-  const check = await checkSite(env, new URL(row.url), row.token);
+  const check = await checkSite(env, new URL(row.url), row);
   if (check.ok) {
-    await env.DB.prepare("UPDATE sites SET title = ?, description = ?, method = ?, security = ?, checked_at = ?, fails = 0 WHERE id = ?")
-      .bind(check.title, check.description, check.method, JSON.stringify(check.security), now, row.id)
+    await env.DB.prepare("UPDATE sites SET title = ?, description = ?, method = ?, proof = ?, security = ?, checked_at = ?, fails = 0 WHERE id = ?")
+      .bind(check.title, check.description, check.method, check.proof, JSON.stringify(check.security), now, row.id)
       .run();
     const detail = `proof=${check.method}${tag}`;
     await appendLog(env, "checked", row.id, row.url, detail);
@@ -475,62 +543,37 @@ async function endorse(request: Request, env: Env, id: string): Promise<Response
 
   if (request.method === "DELETE") {
     if (!row.endorsed_at) return json({ id, endorsed: false });
-    await env.DB.prepare("UPDATE sites SET endorsed_at = 0, endorse_note = '' WHERE id = ?").bind(id).run();
+    await env.DB.prepare("UPDATE sites SET endorsed_at = 0, endorse_note = '', endorse_sig = '' WHERE id = ?").bind(id).run();
     await appendLog(env, "unendorsed", id, row.url);
     return json({ id, endorsed: false });
   }
   const body = (await readJson(request)) ?? {};
   const note = typeof body.note === "string" ? clip(body.note, 160) : "";
-  await env.DB.prepare("UPDATE sites SET endorsed_at = ?, endorse_note = ? WHERE id = ?").bind(Date.now(), note, id).run();
+  const ts = Date.now();
+  const op = await operator(env.OPERATOR_SIGNING_KEY);
+  const signature = await op.sign(endorseMessage(row.url, ts, note));
+  await env.DB.prepare("UPDATE sites SET endorsed_at = ?, endorse_note = ?, endorse_sig = ? WHERE id = ?").bind(ts, note, signature, id).run();
   await appendLog(env, "endorsed", id, row.url, note);
-  return json({ id, endorsed: true, note });
+  return json({ id, endorsed: true, note, statement: endorseMessage(row.url, ts, note), signature, operator_key: op.publicKey });
 }
 
 // ---------- Agent identity ----------
 
-/** Reads agent_key + agent_namespace (or its older name agent_vendor) and returns the handle. */
-async function identityOf(body: Record<string, unknown>): Promise<string | Response> {
-  const namespace = cleanVendor(body.agent_namespace ?? body.agent_vendor);
-  const key = typeof body.agent_key === "string" ? body.agent_key : "";
-  if (!namespace) return apiError(400, "bad_agent_namespace", "agent_namespace must be a reverse-DNS id like com.example.agents or com.anthropic.claude.");
-  if (key.length < 32 || key.length > 200) return apiError(400, "bad_agent_key", "agent_key must be a secret of 32 to 200 characters that you generated and keep private.");
-  return agentHandle(key, namespace);
-}
-
-/** Lets an agent check which profile its key maps to before it lists anything. */
+/** Lets an agent confirm that its key, namespace and signature produce the handle it expects. */
 async function whoami(request: Request, env: Env): Promise<Response> {
   if (await limited(request, env, "verify")) return apiError(429, "rate_limited", "Too many attempts from here. Try again in an hour.");
-  const body = await readJson(request);
-  if (!body) return apiError(400, "bad_json", 'Send {"agent_key": "…", "agent_namespace": "com.example.agents"}.');
-  const identity = await identityOf(body);
-  if (identity instanceof Response) return identity;
-  const sites = await listedBy(env, identity);
+  const who = await signer(request, await request.text());
+  if (who instanceof Response) return who;
+  const sites = await listedBy(env, who.handle);
   return json({
-    agent: identity,
-    profile: `${config(env).site}/${identity}`,
+    agent: who.handle,
+    key: who.key,
+    namespace: who.namespace,
+    signature: "valid",
+    profile: `${config(env).site}/${who.handle}`,
     sites_listed: sites.length,
     namespace_verified: !!sites[0]?.agent_domain,
-    note: sites.length ? "This is your existing profile." : "No listed site under this handle yet. If you expected one, you're using a different key or namespace than before.",
   });
-}
-
-/** Attaches an existing listing to an agent profile. Needs the listing's manage key. */
-async function claim(request: Request, env: Env, id: string): Promise<Response> {
-  const manage = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-  if (!manage) return apiError(401, "unauthorized", "Send Authorization: Bearer <manage_key>.");
-  const row = await env.DB.prepare("SELECT url, status, manage_hash, agent_id FROM sites WHERE id = ?")
-    .bind(id)
-    .first<{ url: string; status: string; manage_hash: string; agent_id: string }>();
-  if (!row) return apiError(404, "not_found", "No site with this id.");
-  if (!safeEqual(await sha256(manage), row.manage_hash)) return apiError(403, "forbidden", "Wrong manage key.");
-  const body = await readJson(request);
-  if (!body) return apiError(400, "bad_json", 'Send {"agent_key": "…", "agent_namespace": "com.example.agents"}.');
-  const identity = await identityOf(body);
-  if (identity instanceof Response) return identity;
-  const name = cleanAgent(body.agent);
-  await env.DB.prepare("UPDATE sites SET agent_id = ?, agent = CASE WHEN ? != '' THEN ? ELSE agent END WHERE id = ?").bind(identity, name, name, id).run();
-  if (row.status === "listed" && row.agent_id !== identity) await appendLog(env, "claimed", id, row.url, `agent=${identity}`);
-  return json({ id, agent: identity, profile: `${config(env).site}/${identity}` });
 }
 
 /** com.example.agents → agents.example.com, then example.com: any of them can vouch for the namespace. */
@@ -690,9 +733,22 @@ async function dropShot(env: Env, key: string): Promise<void> {
   if (key) await env.IMG.delete(key).catch(() => {});
 }
 
+async function receiptFor(env: Env, site: Listing): Promise<Receipt | null> {
+  if (!site.agent_pub) return null;
+  const op = await operator(env.OPERATOR_SIGNING_KEY);
+  const statement = receiptMessage(site.id, site.url, site.agent_id, site.listed_at);
+  return { statement, signature: await op.sign(statement), operator_key: op.publicKey };
+}
+
+export interface Receipt {
+  statement: string;
+  signature: string;
+  operator_key: string;
+}
+
 async function status(env: Env, id: string): Promise<Response> {
   const site = await listing(env, id);
-  if (site) return json({ ...site, status: "listed", events: await siteEvents(env, id) });
+  if (site) return json({ ...site, status: "listed", receipt: await receiptFor(env, site), events: await siteEvents(env, id) });
   const pending = await env.DB.prepare("SELECT id, url, status FROM sites WHERE id = ?").bind(id).first();
   if (pending) return json(pending);
   const events = await siteEvents(env, id);
@@ -700,20 +756,40 @@ async function status(env: Env, id: string): Promise<Response> {
   return apiError(404, "not_found", "No site with this id.");
 }
 
+/** A listing is removed by the key that listed it (a signed request), or by the moderator. */
 async function remove(request: Request, env: Env, id: string): Promise<Response> {
-  const key = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-  if (!key) return apiError(401, "unauthorized", "Send Authorization: Bearer <manage_key>.");
-  const row = await env.DB.prepare("SELECT url, status, manage_hash, shot FROM sites WHERE id = ?")
+  const row = await env.DB.prepare("SELECT url, status, agent_pub, shot FROM sites WHERE id = ?")
     .bind(id)
-    .first<{ url: string; status: string; manage_hash: string; shot: string }>();
+    .first<{ url: string; status: string; agent_pub: string; shot: string }>();
   if (!row) return apiError(404, "not_found", "No site with this id.");
-  const byOwner = safeEqual(await sha256(key), row.manage_hash);
-  const byAdmin = !byOwner && !!env.ADMIN_TOKEN && safeEqual(key, env.ADMIN_TOKEN);
-  if (!byOwner && !byAdmin) return apiError(403, "forbidden", "Wrong manage key.");
+
+  const bearer = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  const byAdmin = !!bearer && !!env.ADMIN_TOKEN && safeEqual(bearer, env.ADMIN_TOKEN);
+  if (!byAdmin) {
+    const who = await signer(request, await request.text());
+    if (who instanceof Response) return who;
+    if (!row.agent_pub || who.key !== row.agent_pub) return apiError(403, "forbidden", "Only the key that listed this site can remove it.");
+  }
   await env.DB.prepare("DELETE FROM sites WHERE id = ?").bind(id).run();
   await dropShot(env, row.shot);
-  if (row.status === "listed") await appendLog(env, "removed", id, row.url, byOwner ? "by_owner" : "by_admin");
+  if (row.status === "listed") await appendLog(env, "removed", id, row.url, byAdmin ? "by_admin" : "by_owner");
   return json({ id, status: "removed" });
+}
+
+/** The head of the log, signed by the operator: a statement it can't take back later. */
+async function signedHead(env: Env): Promise<SignedHead> {
+  const head = (await env.DB.prepare("SELECT seq, hash FROM log ORDER BY seq DESC LIMIT 1").first<{ seq: number; hash: string }>()) ?? { seq: 0, hash: GENESIS };
+  const op = await operator(env.OPERATOR_SIGNING_KEY);
+  const ts = Date.now();
+  return { ...head, ts, signature: await op.sign(logHeadMessage(head.seq, head.hash, ts)), operator_key: op.publicKey };
+}
+
+export interface SignedHead {
+  seq: number;
+  hash: string;
+  ts: number;
+  signature: string;
+  operator_key: string;
 }
 
 // ---------- Transparency log ----------
@@ -754,31 +830,53 @@ async function recentEvents(env: Env, limit: number): Promise<LogEvent[]> {
 // ---------- Checking a site ----------
 
 type Check =
-  | { ok: true; title: string; description: string; method: "file" | "meta"; security: Security }
+  | { ok: true; title: string; description: string; method: "file" | "meta"; proof: string; security: Security }
   | { ok: false; reason: string; message: string };
 
-/** Fetches the page (and /.well-known/agentwork.txt for root URLs) and looks for the token. */
-async function checkSite(env: Env, target: URL, token: string): Promise<Check> {
+/**
+ * Fetches the page (and /.well-known/agentwork.txt for root URLs) and looks for the proof: a
+ * statement naming this address, this challenge and this agent, signed by that agent's key.
+ * Listings made before signatures (no key) still match on their plain token until re-proven.
+ */
+async function checkSite(env: Env, target: URL, expect: { token: string; agent_id: string; agent_pub: string }): Promise<Check> {
   const page = await fetchCapped(env, target);
   if (!page.ok) return page;
   if (!/html/i.test(page.type)) return { ok: false, reason: "not_html", message: `${target.href} didn't return an HTML page.` };
   const head = await readHead(page.body);
 
-  let method: "file" | "meta" | null = head.verify.includes(token) ? "meta" : null;
-  if (!method && target.pathname === "/") {
-    const file = await fetchCapped(env, new URL("/.well-known/agentwork.txt", target.origin), 4096);
-    if (file.ok && file.body.split(/\s+/).includes(token)) method = "file";
+  const accept = async (candidates: string[]): Promise<string | null> => {
+    for (const candidate of candidates.slice(0, 20)) {
+      if (!expect.agent_pub) {
+        if (candidate === expect.token) return candidate;
+        continue;
+      }
+      if (!candidate.startsWith(PROOF_PREFIX)) continue;
+      const proof = await readProof(candidate);
+      const s = proof?.statement;
+      if (s && s.url === target.href && s.challenge === expect.token && s.key === expect.agent_pub && s.agent === expect.agent_id) return candidate;
+    }
+    return null;
+  };
+
+  let method: "file" | "meta" | null = null;
+  let proof = await accept(head.verify);
+  if (proof) method = "meta";
+  if (!proof && target.pathname === "/") {
+    const file = await fetchCapped(env, new URL("/.well-known/agentwork.txt", target.origin), 16_384);
+    if (file.ok) proof = await accept(file.body.split(/\s+/).filter(Boolean));
+    if (proof) method = "file";
   }
-  if (!method) {
+  if (!proof || !method) {
     return {
       ok: false,
       reason: "token_missing",
-      message: `The token wasn't found. Serve it at ${target.origin}/.well-known/agentwork.txt (root URLs only) or add <meta name="agentwork-verify" content="${token}"> to the page's <head>, deploy, and try again.`,
+      message: `No valid proof found. Publish the proof token (the statement you were given, signed with your key) at ${target.origin}/.well-known/agentwork.txt (root URLs only) or in <meta name="agentwork-verify" content="…"> inside the page's <head>, deploy, and try again. A proof is rejected if its signature, address, challenge or key doesn't match this registration.`,
     };
   }
   return {
     ok: true,
     method,
+    proof,
     security: securityOf(page.headers),
     title: clip(head.ogTitle || head.title || target.hostname, 100),
     description: clip(head.description || head.ogDescription, 240),
@@ -915,11 +1013,6 @@ function cleanVendor(raw: unknown): string {
   return v.length <= 60 && VENDOR.test(v) ? v : "";
 }
 
-/** The profile handle: 64 bits of a hash over the vendor and the agent's secret key. */
-async function agentHandle(key: string, vendor: string): Promise<string> {
-  return `${(await sha256(`agentwork-agent\n${vendor}\n${key}`)).slice(0, 16)}@${vendor}`;
-}
-
 function safeDecode(s: string): string {
   try {
     return decodeURIComponent(s);
@@ -929,7 +1022,7 @@ function safeDecode(s: string): string {
 }
 
 function parseHandle(raw: string): Handle | null {
-  const m = /^([0-9a-f]{16})@(.+)$/.exec(raw);
+  const m = new RegExp(`^([0-9a-f]{${HANDLE_HASH_LENGTH}})@(.+)$`).exec(raw);
   if (!m || !cleanVendor(m[2]) || cleanVendor(m[2]) !== m[2]) return null;
   return { id: raw, hash: m[1], vendor: m[2] };
 }
@@ -1006,8 +1099,7 @@ async function limited(request: Request, env: Env, action: keyof typeof LIMITS):
   return (row?.n ?? 0) > n;
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown> | null> {
-  const raw = await request.text();
+function parseJson(raw: string): Record<string, unknown> | null {
   if (raw.length > MAX_BODY) return null;
   try {
     const v = JSON.parse(raw);
@@ -1015,6 +1107,10 @@ async function readJson(request: Request): Promise<Record<string, unknown> | nul
   } catch {
     return null;
   }
+}
+
+async function readJson(request: Request): Promise<Record<string, unknown> | null> {
+  return parseJson(await request.text());
 }
 
 async function sha256(s: string): Promise<string> {
@@ -1075,6 +1171,6 @@ function withCors(res: Response): Response {
   const out = new Response(res.body, res);
   out.headers.set("access-control-allow-origin", "*");
   out.headers.set("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
-  out.headers.set("access-control-allow-headers", "content-type, authorization");
+  out.headers.set("access-control-allow-headers", "content-type, authorization, x-agent-key, x-agent-namespace, x-agent-timestamp, x-agent-signature");
   return out;
 }

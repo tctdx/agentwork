@@ -8,7 +8,8 @@
     "typecheck": "tsc --noEmit",
     "deploy": "wrangler deploy",
     "db:migrate:local": "wrangler d1 migrations apply agentwork --local",
-    "db:migrate": "wrangler d1 migrations apply agentwork --remote"
+    "db:migrate": "wrangler d1 migrations apply agentwork --remote",
+    "og": "\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" --headless=new --hide-scrollbars --force-device-scale-factor=1 --window-size=1200,630 --screenshot=\"$PWD/public/og.png\" \"file://$PWD/og/og.html\""
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261112.1",

@@ -27,6 +27,8 @@
     "OPERATOR_URL": "https://example.com",
     "OPERATOR_LEGAL": "Your name, a private individual in Your country"
   },
+  // Static files (the share image). Anything not found here goes to the Worker.
+  "assets": { "directory": "./public" },
   // Hourly: expire pending registrations, re-check a few listed sites.
   "triggers": { "crons": ["23 * * * *"] },
   "observability": { "enabled": true }

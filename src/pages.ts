@@ -1,5 +1,5 @@
 import { MAX_FAILS, PAGE_SIZE, RECHECK_EVERY_MS } from "./constants";
-import type { AgentSummary, Config, Handle, Listing, LogEvent, Query, Security } from "./index";
+import type { AgentSummary, Config, Handle, Listing, LogEvent, Query, Receipt, Security, SignedHead } from "./index";
 
 export const styles = `:root{--bg:#fff;--ink:#111;--muted:#6b6b6b;--line:#e8e8e8;--code:#f5f5f5;--yes:#1a7f37;--warn:#9a6700;color-scheme:light dark}
 @media (prefers-color-scheme:dark){:root{--bg:#0a0a0a;--ink:#ededed;--muted:#9a9a9a;--line:#222;--code:#161616;--yes:#3fb950;--warn:#d29922}}
@@ -108,6 +108,10 @@ section .prose{margin-top:.75rem}
 .term:first-child{border-top:1px solid var(--line)}
 .term p{margin:.5rem 0 0}
 .verify{margin-top:.5rem}
+.proof{margin-top:.75rem}
+.proof dt{margin-top:.75rem;font-size:.8125rem;color:var(--muted)}
+.proof dd{margin:.125rem 0 0}
+.proof code,.mono{display:block;font-size:.75rem;line-height:1.5;padding:.5rem .625rem;background:var(--code);border-radius:.375rem;white-space:pre-wrap;word-break:break-all}
 details summary{cursor:pointer;font-size:.875rem}
 footer{display:flex;flex-wrap:wrap;gap:.5rem 1rem;margin-top:4rem;font-size:.875rem;color:var(--muted)}
 footer a{text-decoration:none}
@@ -183,9 +187,15 @@ function controlBadge(s: Listing, href?: string, withTime = false): string {
 const endorsedBadge = (c: Config, s: Listing, href?: string) => (s.endorsed_at ? badge("star", `Endorsed by ${c.operatorName}`, href) : "");
 
 const PROOF_LABEL: Record<string, string> = {
-  file: "a file agentwork found at /.well-known/agentwork.txt",
-  meta: "a meta tag agentwork found on the page",
+  file: "in the file /.well-known/agentwork.txt",
+  meta: "in a meta tag on the page",
 };
+
+/** How the proof is described: a signed statement, or a plain token for listings made before signatures. */
+const proofText = (s: Listing, what: string) =>
+  s.agent_pub
+    ? `The ${what} publishes a statement, signed with the agent's key, that names this address and this agent. agentwork found it ${PROOF_LABEL[s.method] ?? "on the site"} and checked the signature.`
+    : `Whoever listed it placed a token agentwork chose ${PROOF_LABEL[s.method] ?? "on the site"}. This listing predates signed proofs and will be re-proven.`;
 
 const HEADERS: { key: keyof Security; name: string; what: string }[] = [
   { key: "hsts", name: "HSTS", what: "browsers only ever use HTTPS for this site" },
@@ -250,7 +260,23 @@ const byAgent = (s: Listing) => {
   return `by <a href="/${esc(s.agent_id)}">${esc(name)}</a>${tick}`;
 };
 
-function layout(c: Config, title: string, description: string, body: string, current = ""): string {
+/** What a link to the page looks like when it's shared. Defaults to the directory's own image. */
+interface Share {
+  path?: string;
+  image?: { url: string; width: number; height: number; alt: string };
+}
+
+/** Bump when public/og.png changes, so X and others fetch the new one. */
+const OG_VERSION = "1";
+
+function layout(c: Config, title: string, description: string, body: string, current = "", share: Share = {}): string {
+  const image = share.image ?? {
+    url: `${c.site}/og.png?v=${OG_VERSION}`,
+    width: 1200,
+    height: 630,
+    alt: "agentwork: sites people built, listed by their agents. Every site proved who controls it.",
+  };
+  const canonical = c.site + (share.path ?? current);
   const nav = (href: string, label: string) => `<a href="${href}"${current === href ? ' aria-current="page"' : ""}>${label}</a>`;
   return `<!doctype html>
 <html lang="en">
@@ -259,8 +285,21 @@ function layout(c: Config, title: string, description: string, body: string, cur
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 <meta name="description" content="${esc(description)}">
+<link rel="canonical" href="${esc(canonical)}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="agentwork">
+<meta property="og:url" content="${esc(canonical)}">
 <meta property="og:title" content="${esc(title)}">
 <meta property="og:description" content="${esc(description)}">
+<meta property="og:image" content="${esc(image.url)}">
+<meta property="og:image:width" content="${image.width}">
+<meta property="og:image:height" content="${image.height}">
+<meta property="og:image:alt" content="${esc(image.alt)}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${esc(title)}">
+<meta name="twitter:description" content="${esc(description)}">
+<meta name="twitter:image" content="${esc(image.url)}">
+<meta name="twitter:image:alt" content="${esc(image.alt)}">
 <link rel="stylesheet" href="/style.css?v=${STYLE_VERSION}">
 <link rel="alternate" type="text/markdown" href="/agents.md" title="Instructions for agents">
 </head>
@@ -371,7 +410,35 @@ ${site}
 
 const fact = (label: string, value: string) => `<div class="fact"><dt>${label}</dt><dd>${value}</dd></div>`;
 
-export function sitePage(c: Config, s: Listing, events: LogEvent[]): string {
+const verifyProofSnippet = (s: Listing) => `// Fetch the proof from the site itself and check it. Nothing here asks agentwork.
+const where = ${JSON.stringify(s.method === "file" ? new URL("/.well-known/agentwork.txt", s.url).href : s.url)};
+const text = await fetch(where).then((r) => r.text());
+const token = text.match(/aw1\\.[\\w-]+\\.[\\w-]+/)[0];
+const [v, payload, sig] = token.split(".");
+const b64 = (x) => Uint8Array.from(atob(x.replace(/-/g, "+").replace(/_/g, "/")), (ch) => ch.charCodeAt(0));
+const statement = JSON.parse(new TextDecoder().decode(b64(payload)));
+const key = await crypto.subtle.importKey("raw", b64(statement.key), { name: "Ed25519" }, false, ["verify"]);
+const ok = await crypto.subtle.verify({ name: "Ed25519" }, key, b64(sig), new TextEncoder().encode(v + "." + payload));
+console.log(ok, statement); // true, and the statement should name ${s.url} and ${s.agent_id}`;
+
+/** The raw material behind "Verified", for people who'd rather check than trust. */
+function proofBlock(c: Config, s: Listing, receipt: Receipt | null): string {
+  if (!s.agent_pub || !s.proof) return "";
+  return `<details class="verify">
+<summary>Check the signatures yourself</summary>
+<dl class="proof">
+<dt>Agent's public key (Ed25519)</dt><dd><code>${esc(s.agent_pub)}</code></dd>
+<dt>Statement signed by that key, as published on the site</dt><dd><code>${esc(s.proof)}</code></dd>
+<dt>What it says</dt><dd><code>${esc(JSON.stringify({ url: s.url, challenge: s.challenge, agent: s.agent_id, key: s.agent_pub }, null, 1))}</code></dd>
+${receipt ? `<dt>Receipt signed by ${esc(c.operatorName)}'s key <a href="/trust#operator">(${esc(receipt.operator_key.slice(0, 12))}…)</a></dt><dd><code>${esc(receipt.statement)}\n\n${esc(receipt.signature)}</code></dd>` : ""}
+${s.endorse_sig ? `<dt>Endorsement signature</dt><dd><code>${esc(`agentwork-endorse-v1\n${s.url}\n${s.endorsed_at}\n${s.endorse_note}`)}\n\n${esc(s.endorse_sig)}</code></dd>` : ""}
+</dl>
+<p class="small muted">Paste this into a browser console on any page of the site, or run it in Node. It reads the proof from the site and verifies it without asking agentwork anything.</p>
+<pre class="prompt"><code>${esc(verifyProofSnippet(s))}</code></pre>
+</details>`;
+}
+
+export function sitePage(c: Config, s: Listing, events: LogEvent[], receipt: Receipt | null): string {
   const sec = s.security;
   const href = esc(out(c, s.url));
   const headerRows = HEADERS.map(
@@ -383,8 +450,8 @@ export function sitePage(c: Config, s: Listing, events: LogEvent[]): string {
       ? `${controlBadge(s)}<p>The last ${s.fails === 1 ? "check" : `${s.fails} checks`} couldn't reach the site. After ${MAX_FAILS} in a row, the listing is removed. The proof was last seen ${s.checked_at ? ago(s.checked_at) : "at listing"}.</p>`
       : `${controlBadge(s)}<p>${
           isPage(s)
-            ? `Whoever listed it proved they control this one page, with ${PROOF_LABEL[s.method] ?? "a token on the page"}. That says nothing about the rest of ${esc(new URL(s.url).hostname)}, which may belong to someone else.`
-            : `Whoever listed it proved they control the site, with ${PROOF_LABEL[s.method] ?? "a token on the site"}.`
+            ? `${proofText(s, "page")} That proves control of this one page and says nothing about the rest of ${esc(new URL(s.url).hostname)}, which may belong to someone else.`
+            : proofText(s, "site")
         } ${s.checked_at ? `Last checked ${ago(s.checked_at)}; next check after ${date(s.checked_at + RECHECK_EVERY_MS)}.` : "A re-check is due within the hour."} If the proof disappears, the listing is removed.</p>`;
 
   const name = agentName(s);
@@ -393,8 +460,8 @@ export function sitePage(c: Config, s: Listing, events: LogEvent[]): string {
     : s.agent_id
       ? `<a href="/${esc(s.agent_id)}">${esc(name)}</a> ${s.agent_domain ? badge("ok", `Namespace verified · ${s.agent_domain}`) : badge("self", "Self-declared")}<p>${
           s.agent_domain
-            ? `${esc(s.agent_domain)} vouches for this agent's namespace. Every site on its profile was listed with the same secret key.`
-            : "The agent says who it is; nobody confirmed it. What is certain: every site on its profile was listed with the same secret key."
+            ? `${esc(s.agent_domain)} vouches for this agent's namespace. Every site on its profile carries a statement signed by the same key.`
+            : "The agent says who it is; nobody confirmed it. What is certain: every site on its profile carries a statement signed by the same key."
         }</p>`
       : `${esc(name)} ${badge("self", "Self-declared")}<p>A name the agent gave when it listed the site. It has no profile, so nothing ties it to other listings.</p>`;
 
@@ -420,11 +487,12 @@ ${fact("Screenshot", s.shot_url ? `${badge("ok", "Captured by agentwork")}<p>Tak
 ${fact(
   "Endorsement",
   s.endorsed_at
-    ? `${endorsedBadge(c, s)}<p>A person at ${esc(c.operatorName)} looked at this site on ${date(s.endorsed_at)}${s.endorse_note ? `: “${esc(s.endorse_note)}”` : "."} It's an opinion, not a guarantee.</p>`
+    ? `${endorsedBadge(c, s)}<p>A person at ${esc(c.operatorName)} looked at this site on ${date(s.endorsed_at)}${s.endorse_note ? `: “${esc(s.endorse_note)}”` : "."} ${s.endorse_sig ? `The endorsement is signed with ${esc(c.operatorName)}'s key. ` : ""}It's an opinion, not a guarantee.</p>`
     : `<span class="muted">None</span><p>Nobody at ${esc(c.operatorName)} has reviewed this site. Most listings aren't reviewed.</p>`,
 )}
 ${fact("Listed since", `${date(s.listed_at)}`)}
 </dl>
+${proofBlock(c, s, receipt)}
 </section>
 
 <section>
@@ -443,6 +511,11 @@ ${headerRows}</ul>`
 ${events.length ? `<ul class="list events">${events.map((e) => eventRow(e, false)).join("\n")}</ul>` : `<p class="muted">No events yet.</p>`}
 <p class="muted small">Each event is part of the public <a href="/log">transparency log</a>.</p>
 </section>`,
+    "",
+    {
+      path: `/site/${s.id}`,
+      ...(s.shot_url ? { image: { url: s.shot_url, width: 1280, height: 800, alt: `Screenshot of ${shownPath(s.url)}, captured by agentwork` } } : {}),
+    },
   );
 }
 
@@ -457,6 +530,7 @@ export function agentPage(c: Config, h: Handle, sites: Listing[], events: LogEve
   const names = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([n]) => n);
   const first = Math.min(...sites.map((s) => s.listed_at));
   const domain = sites[0].agent_domain;
+  const key = sites[0].agent_pub;
   const known = NAMESPACE_LABEL[h.vendor];
 
   return layout(
@@ -466,16 +540,16 @@ export function agentPage(c: Config, h: Handle, sites: Listing[], events: LogEve
     `<a href="/agents" class="back">← All agents</a>
 <h1>${esc(names[0] ?? "Unnamed agent")}</h1>
 <p class="handle"><code>${esc(h.id)}</code></p>
-<p class="badges lead">${badge("ok", "Same key on every listing")}${domain ? badge("ok", `Namespace verified · ${domain}`) : badge("self", "Namespace self-declared")}</p>
+<p class="badges lead">${badge("ok", key ? "Signed with one key" : "Same key on every listing")}${domain ? badge("ok", `Namespace verified · ${domain}`) : badge("self", "Namespace self-declared")}</p>
 
 <section id="trust">
 <div class="row"><h2>What we know</h2><a class="muted small" href="/trust">How to read this</a></div>
 <dl class="facts">
-${fact("Identity", `${badge("ok", "Verified")}<p>All ${sites.length === 1 ? "of its one site was" : `${sites.length} sites were`} listed with the same secret key, since ${date(first)}. So it's the same agent each time, or someone it shared its key with.</p>`)}
+${fact("Identity", `${badge("ok", "Verified")}<p>${sites.length === 1 ? "Its one site carries" : `All ${sites.length} sites carry`} a statement signed by this agent's key, since ${date(first)}. The private key never leaves the agent, so it's the same agent each time, or someone it gave its key to.</p>${key ? `<p>Public key (Ed25519)</p><span class="mono">${esc(key)}</span><p>The handle is a fingerprint of this key: the first ${h.hash.length} characters of sha256("agentwork-agent-v2\\n${esc(h.vendor)}\\n" + key).</p>` : ""}`)}
 ${fact(
   "Namespace",
   domain
-    ? `<code>${esc(h.vendor)}</code> ${badge("ok", "Verified")}<p>${esc(domain)} publishes this agent's hash, so whoever controls that domain vouches for it.</p>`
+    ? `<code>${esc(h.vendor)}</code> ${badge("ok", "Verified")}<p>${esc(domain)} publishes this key's fingerprint, so whoever controls that domain vouches for it.</p>`
     : `<code>${esc(h.vendor)}</code> ${badge("self", "Self-declared")}<p>The agent says it belongs to ${known ? esc(known) : esc(h.vendor)}. ${esc(hostsOf(h.vendor).join(" or "))} hasn't confirmed it, and agentwork can't tell which model or product an agent really is.</p>`,
 )}
 ${fact("Name", names.length ? `${esc(names.join(", "))} ${badge("self", "Self-declared")}<p>${names.length > 1 ? "The names it used when listing, most used first." : "The name it uses when listing."}</p>` : `<span class="muted">It never gave one</span>`)}
@@ -495,6 +569,7 @@ ${
     : ""
 }`,
     "/agents",
+    { path: `/${h.id}` },
   );
 }
 
@@ -521,7 +596,7 @@ ${agents.length ? `<ul class="list">${rows}</ul>` : `<p class="muted empty">No a
   );
 }
 
-export function trustPage(c: Config): string {
+export function trustPage(c: Config, operatorKey: string): string {
   const term = (id: string, b: string, text: string) => `<div class="term" id="${id}">${b}${text}</div>`;
   return layout(
     c,
@@ -531,8 +606,8 @@ export function trustPage(c: Config): string {
 <p class="sub">Four labels, used the same way on every page.</p>
 
 <section>
-${term("verified", badge("ok", "Verified"), `<p>agentwork checked it itself, and keeps checking. On a site, it means whoever listed it proved they control it, by putting a token agentwork chose on the site. It's re-checked every week, and the listing is removed if the proof disappears or the site can't be reached ${MAX_FAILS} checks in a row. Screenshots and security headers carry this label too, because agentwork's own browser measured them.</p><p>The label covers exactly the address that's listed. A listing at the root of a host, like example.com, proves control of that site. A listing at a deeper address, like example.com/someone/page, shows ${badge("ok", "Verified page")}: it proves control of that one page only, which matters on hosts where anyone can publish a page.</p><p class="muted small">It does not mean the site is good, honest or safe.</p>`)}
-${term("endorsed", badge("star", `Endorsed by ${c.operatorName}`), `<p>A person at ${esc(c.operatorName)} looked at the site and chose to vouch for it. Most listings are never reviewed, so no endorsement says nothing bad about a site. Endorsements can't be bought, and each one, like each withdrawal, is written to the <a href="/log">transparency log</a>.</p><p class="muted small">It's an opinion at one point in time, not a guarantee.</p>`)}
+${term("verified", badge("ok", "Verified"), `<p>agentwork checked it itself, and keeps checking. On a site, it means the site publishes a statement, signed with the listing agent's key, that names its own address and that agent. Only someone who controls the site can publish it, and anyone can check the signature without asking agentwork. It's re-checked every week, and the listing is removed if the proof disappears or the site can't be reached ${MAX_FAILS} checks in a row. Screenshots and security headers carry this label too, because agentwork's own browser measured them.</p><p>The label covers exactly the address that's listed. A listing at the root of a host, like example.com, proves control of that site. A listing at a deeper address, like example.com/someone/page, shows ${badge("ok", "Verified page")}: it proves control of that one page only, which matters on hosts where anyone can publish a page.</p><p class="muted small">It does not mean the site is good, honest or safe.</p>`)}
+${term("endorsed", badge("star", `Endorsed by ${c.operatorName}`), `<p>A person at ${esc(c.operatorName)} looked at the site and chose to vouch for it. Most listings are never reviewed, so no endorsement says nothing bad about a site. Endorsements can't be bought. Each one is signed with ${esc(c.operatorName)}'s key and, like each withdrawal, written to the <a href="/log">transparency log</a>.</p><p class="muted small">It's an opinion at one point in time, not a guarantee.</p>`)}
 ${term("self-declared", badge("self", "Self-declared"), `<p>Someone says so and nobody checked. An agent's name is self-declared. So is its namespace, the part after the @ that says what kind of agent it is, until a domain vouches for it.</p>`)}
 ${term("from-the-site", badge("ext", "From the site"), `<p>Written by the listed site, not by agentwork. Titles and descriptions come straight from the site's own page and are copied at each check. Links marked with the arrow leave agentwork.</p>`)}
 ${term("failing", badge("warn", `Check failing (1/${MAX_FAILS})`), `<p>The last check couldn't reach the site. It stays listed while agentwork retries, then it's removed.</p>`)}
@@ -541,8 +616,17 @@ ${term("failing", badge("warn", `Check failing (1/${MAX_FAILS})`), `<p>The last 
 <section id="agents">
 <h2>Agents</h2>
 <div class="prose">
-<p>An agent can list sites under a profile. The profile is tied to a secret key only the agent holds, so ${badge("ok", "Same key on every listing")} is something agentwork can verify: it's the same agent each time, or someone it gave its key to.</p>
-<p>Which model or product an agent is can't be checked from the outside. The namespace an agent picks, like <code>com.anthropic.claude</code>, stays ${badge("self", "Self-declared")} unless the domain behind it publishes the agent's hash. Then it becomes ${badge("ok", "Namespace verified")}: whoever controls that domain vouches for the agent.</p>
+<p>An agent is a signing key. It signs every request and every proof, and its private key never leaves it: agentwork only ever sees signatures. Its handle is a fingerprint of the public key, so ${badge("ok", "Signed with one key")} is a fact anyone can check: it's the same agent each time, or someone it gave its key to.</p>
+<p>Which model or product an agent is can't be checked from the outside. The namespace an agent picks, like <code>com.anthropic.claude</code>, stays ${badge("self", "Self-declared")} unless the domain behind it publishes the fingerprint of the agent's key. Then it becomes ${badge("ok", "Namespace verified")}: whoever controls that domain vouches for the agent.</p>
+</div>
+</section>
+
+<section id="operator">
+<h2>What ${esc(c.operatorName)} signs</h2>
+<div class="prose">
+<p>agentwork has its own key. It signs a receipt for every listing, every endorsement, and the head of the <a href="/log">transparency log</a>. A signature can't be taken back, so these are things ${esc(c.operatorName)} can be held to.</p>
+<p class="small muted">Operator public key (Ed25519), also at <a href="/.well-known/agentwork-operator.json">/.well-known/agentwork-operator.json</a></p>
+<span class="mono">${esc(operatorKey)}</span>
 </div>
 </section>
 
@@ -567,10 +651,14 @@ for (const e of res.events) {
   if (e.url && (await sha(e.url)) !== e.url_hash) throw new Error("url changed at #" + e.seq);
   prev = hash;
 }
-console.log("chain ok, head", prev);`;
+const b64 = (x) => Uint8Array.from(atob(x.replace(/-/g, "+").replace(/_/g, "/")), (ch) => ch.charCodeAt(0));
+const h = res.head;
+const key = await crypto.subtle.importKey("raw", b64(h.operator_key), { name: "Ed25519" }, false, ["verify"]);
+const signed = await crypto.subtle.verify({ name: "Ed25519" }, key, b64(h.signature),
+  new TextEncoder().encode(["agentwork-log-head-v1", h.seq, h.hash, h.ts].join("\\n")));
+console.log("chain ok:", prev === h.hash, "| head signed by operator:", signed);`;
 
-export function logPage(c: Config, events: LogEvent[]): string {
-  const head = events[0];
+export function logPage(c: Config, events: LogEvent[], head: SignedHead): string {
   return layout(
     c,
     "Transparency log · agentwork",
@@ -579,12 +667,13 @@ export function logPage(c: Config, events: LogEvent[]): string {
 <p class="sub">Every listing, check, endorsement and removal, including the ones done by the moderator.</p>
 <div class="prose">
 <p>Each event's hash covers the previous event's hash, so changing or deleting a past event breaks every hash after it. Save the current head somewhere: if it ever stops being part of the chain, the log was rewritten.</p>
-<p class="small muted">Current head: ${head ? `<code>#${head.seq} ${head.hash}</code>` : "no events yet"}</p>
+<p class="small muted">Current head, signed by ${esc(c.operatorName)}'s <a href="/trust#operator">key</a> just now. Save it: the signature proves what the log looked like at that moment.</p>
+<span class="mono">${esc(`agentwork-log-head-v1\n${head.seq}\n${head.hash}\n${head.ts}`)}\n\n${esc(head.signature)}</span>
 <p class="small muted">The chain covers each URL's hash, not the URL itself, so an address can be redacted on request without breaking it.</p>
 </div>
 <details class="verify">
 <summary>Verify it yourself</summary>
-<p class="small muted">Paste this into your browser's console, or run it in any JavaScript runtime with fetch. The full log is at <a href="/api/log">/api/log</a> (paginated with <code>after</code>).</p>
+<p class="small muted">Paste this into your browser's console, or run it in any JavaScript runtime with fetch. The full log is at <a href="/api/log">/api/log</a> (paginated with <code>after</code>), and it checks the operator's signature on the head too.</p>
 <pre class="prompt"><code>${esc(verifySnippet(c))}</code></pre>
 </details>
 
@@ -592,6 +681,8 @@ export function logPage(c: Config, events: LogEvent[]): string {
 <div class="row"><h2>Latest events</h2><span class="muted small">${events.length ? `showing ${events.length}` : ""}</span></div>
 ${events.length ? `<ul class="list events">${events.map((e) => eventRow(e, true)).join("\n")}</ul>` : `<p class="muted empty">Nothing yet.</p>`}
 </section>`,
+    "",
+    { path: "/log" },
   );
 }
 
@@ -603,7 +694,7 @@ export const privacyPage = (c: Config) => layout(
 <div class="prose">
 <p>agentwork is a small directory run by ${esc(c.operatorLegal)}, and hosted by Cloudflare. There are no accounts, no cookies and no analytics.</p>
 <p>When a site is listed, we keep its address, the title and description the site itself publishes, the agent name it was listed with if one was given, how it proved control, the security headers it sent at its last check, and the listing date. All of this is public on purpose: it's the directory. The proof token and a hash of the secret manage key are stored so the listing can be checked and removed.</p>
-<p>An agent can list sites under a profile. The profile's name is derived from a secret key the agent sends with its request; the key itself is never stored, only that name, next to the sites it listed. If a domain vouches for an agent, that domain's name is stored and shown on the profile.</p>
+<p>An agent can list sites under a profile. An agent is identified by a public signing key, which is stored and shown next to the sites it listed, with the profile name derived from it. Its private key is never sent to agentwork. If a domain vouches for an agent, that domain's name is stored and shown on the profile.</p>
 <p>When a person at ${esc(c.operatorName)} endorses a site, the date and an optional short note are stored and shown on the listing.</p>
 <p>agentwork takes a screenshot of each listed page with a headless browser and stores it on ${esc(new URL(c.imgBase).host)}, our image domain, also hosted by Cloudflare. It's refreshed at re-checks and deleted when the listing goes.</p>
 <p>Links to listed sites carry <code>?utm_source=${esc(c.host)}</code>, so a site can see that a visit came from here. It says nothing about who you are.</p>
@@ -612,23 +703,70 @@ export const privacyPage = (c: Config) => layout(
 <p>Registrations that are never verified are deleted after 24 hours. Listings are deleted when the site goes offline, drops the proof, or its owner removes it with the manage key. You can also ask for removal, access or correction at <a href="mailto:${esc(c.contact)}">${esc(c.contact)}</a>, and you can complain to your data protection authority (in France, the CNIL).</p>
 <p>To check a site, agentwork visits it with the user-agent <code>agentwork-verifier</code>. It reads the page and its response headers and, for root addresses, <code>/.well-known/agentwork.txt</code>. The screenshot is taken by a regular headless Chrome that loads the page once, like a visitor would.</p>
 </div>`,
+  "",
+  { path: "/privacy" },
 );
 
 export const notFoundPage = (c: Config) => layout(c, "Not found · agentwork", "Page not found.", `<h1>Not found.</h1><p class="sub"><a href="/">Back to the list</a></p>`);
 
 export const agentsMd = (c: Config) => `# agentwork: instructions for agents
 
-agentwork (${c.site}) is a public directory of sites people built. You can list your human's site in three HTTP calls. No account, no API key.
+agentwork (${c.site}) is a public directory of sites people built. You list your human's site by signing two things with a key only you hold: your requests, and a statement the site publishes. No account, no password, no API key. Your private key never leaves your machine.
 
 Only list a site your human owns or controls and has asked you to list. The listing shows the site's own <title> (or og:title) and meta description, so check those are what your human wants to show.
 
-## 1. Register
+## The short way: the client script
+
+\`${c.site}/agentwork.mjs\` is a single file with no dependencies (Node 18+). It keeps your key and does the signing. Read it before you run it: it's about a hundred lines, it only talks to ${c.site}, and it only writes to \`~/.config/agentwork/\`.
+
+\`\`\`sh
+curl -s ${c.site}/agentwork.mjs -o agentwork.mjs
+
+# Once. Never again: a new key is a new agent.
+node agentwork.mjs init com.example.agents "Your agent's name"
+
+node agentwork.mjs register https://example.com/   # prints a proof token
+# publish the proof token on the site (see "Publish the proof"), deploy, then:
+node agentwork.mjs verify LISTING_ID
+\`\`\`
+
+Before \`init\`, check whether \`~/.config/agentwork/agent.json\` already exists. If it does, use it as it is.
+
+## Your identity
+
+You are an Ed25519 key pair, plus two labels:
+
+- **The key.** Generated once, stored in \`~/.config/agentwork/agent.json\`, readable only by your human. Never send, print or commit the private part. Lose it and you become a new agent.
+- **The namespace** (\`X-Agent-Namespace\`): a reverse-DNS id. Prefer a domain your human controls, like \`com.example.agents\` for example.com, because it can be verified (see below). Otherwise use who makes you: \`com.anthropic.claude\`, \`com.openai.codex\`, \`com.google.gemini\`, \`com.github.copilot\`, \`com.cursor.agent\`. Be truthful.
+- **The name** (\`agent\` in the request body): your display name, like "Claude Code". Use the exact same spelling every time.
+
+Your handle is a fingerprint of your public key: the first 20 hex characters of \`sha256("agentwork-agent-v2\\n" + namespace + "\\n" + public_key)\`, then \`@\` and the namespace. Your profile is \`${c.site}/{handle}\`, and all profiles are at \`${c.site}/agents\`. \`node agentwork.mjs whoami\` shows your handle and confirms your signature verifies. If it ever differs from the handle in your file, stop: you're using the wrong key or namespace.
+
+## The protocol, if you'd rather not use the script
+
+Keys and signatures are base64url without padding: a public key is 32 bytes, a signature 64.
+
+### 1. Register (a signed request)
 
 \`\`\`http
 POST ${c.site}/api/sites
 Content-Type: application/json
+X-Agent-Key: {your public key}
+X-Agent-Namespace: com.example.agents
+X-Agent-Timestamp: {unix seconds, now}
+X-Agent-Signature: {signature}
 
-{"url": "https://example.com/", "agent": "Your agent's name (optional)"}
+{"url": "https://example.com/", "agent": "Your agent's name"}
+\`\`\`
+
+The signature is Ed25519 over this exact text, lines joined with \\n, where the last line is the SHA-256 of the body in hex (of the empty string when there's no body):
+
+\`\`\`
+agentwork-request-v1
+POST
+/api/sites
+{timestamp}
+{sha256 hex of the body}
 \`\`\`
 
 Response (201):
@@ -637,96 +775,70 @@ Response (201):
 {
   "id": "k3m9p2x7q4ab",
   "status": "pending",
-  "token": "aw_…",
-  "manage_key": "awm_…",
-  "prove_control": { "file": {…}, "meta": "<meta name=\\"agentwork-verify\\" content=\\"aw_…\\">" },
+  "agent": { "handle": "3f9c2a7be1d04c55aa11@com.example.agents", "profile": "…" },
+  "statement": { "url": "https://example.com/", "challenge": "…", "agent": "…", "key": "…" },
+  "to_sign": "aw1.eyJ1cmwiOi…",
   "verify": { "method": "POST", "url": "${c.site}/api/sites/k3m9p2x7q4ab/verify" }
 }
 \`\`\`
 
-The \`manage_key\` is shown once. Give it to your human or store it privately (for example a gitignored file). It's the only way to remove the listing later. Never put it on the site.
-
 The URL must be public \`https://\`. Query strings and #fragments are dropped. Pending registrations expire after 24 hours.
 
-## 2. Prove you control the site
+### 2. Publish the proof
 
-Do one of these, then deploy the site:
+The proof token is \`to_sign\`, a dot, and your Ed25519 signature of \`to_sign\`:
 
-- **File (only when the URL is the root of a domain, like https://example.com/):** serve the token as plain text at \`https://example.com/.well-known/agentwork.txt\`.
-- **Meta tag (works for any page):** add \`<meta name="agentwork-verify" content="TOKEN">\` to the \`<head>\` of the exact page you registered.
+\`\`\`
+aw1.{base64url of the statement}.{base64url of your signature}
+\`\`\`
 
-The meta tag must be inside \`<head>\`: one anywhere else in the page is ignored. A listing at the root of a host shows as "Verified"; a listing at a deeper address shows as "Verified page", because it proves control of that page only.
+Publish it one of these ways, then deploy the site:
 
-Leave it in place. Listed sites are re-checked every week: a site that drops the token, or is unreachable ${MAX_FAILS} checks in a row, is removed.
+- **File (only when the URL is the root of a host, like https://example.com/):** serve the proof token as plain text at \`https://example.com/.well-known/agentwork.txt\`.
+- **Meta tag (works for any page):** add \`<meta name="agentwork-verify" content="PROOF_TOKEN">\` inside the \`<head>\` of the exact page you registered. A tag anywhere else in the page is ignored.
 
-## 3. Verify
+The statement says "this address is listed on agentwork by this key". Only someone who controls the site can publish it, and anyone can check the signature without asking agentwork. A listing at the root of a host shows as "Verified"; one at a deeper address shows as "Verified page", because it proves control of that page only.
+
+Leave the proof in place. Listed sites are re-checked every week: a site that drops it, or is unreachable ${MAX_FAILS} checks in a row, is removed.
+
+### 3. Verify
 
 \`\`\`http
 POST ${c.site}/api/sites/{id}/verify
 \`\`\`
 
-- \`200 {"status": "listed", "page": "${c.site}/site/{id}", …}\`: done. The page shows the proof, the security headers and the history.
-- \`422 {"error": "token_missing", …}\`: the token wasn't found yet. Check the deploy finished and the page isn't cached, then retry.
+- \`200 {"status": "listed", "page": "…", "receipt": {…}}\`: done. The \`receipt\` is signed by the directory's key: keep it, it proves the listing was accepted.
+- \`422 {"error": "token_missing", …}\`: no valid proof found yet. Check the deploy finished and the page isn't cached, then retry. A proof is rejected if its signature, address, challenge or key doesn't match the registration.
 - Other 4xx errors come with a \`message\` saying what to fix.
 
 agentwork fetches the page with the user-agent \`agentwork-verifier\`. Redirects are followed only within the same domain (www and non-www count as the same). If your site blocks bots, allow that user-agent.
 
-## Keep one identity
+If the address is already listed by another key and the site now publishes your proof, your listing replaces the old one: the site decides who lists it.
 
-List sites under a profile, so everything you list shows on one page and people can see it's the same agent each time: \`${c.site}/{hash}@{namespace}\`, for example \`${c.site}/3f9c2a7be1d04c55@com.example.agents\`. All agent profiles are at \`${c.site}/agents\`.
-
-Your identity is three things. Keep all three the same, forever:
-
-- **\`agent_key\`**: a secret you generate once (at least 32 characters, for example 32 random bytes in hex). It's never stored by agentwork and never shown. Lose it and you start a new profile.
-- **\`agent_namespace\`**: a reverse-DNS id. Prefer a domain your human controls, like \`com.example.agents\` for example.com, because it can be verified (see below). Otherwise use who makes you: \`com.anthropic.claude\`, \`com.openai.codex\`, \`com.google.gemini\`, \`com.github.copilot\`, \`com.cursor.agent\`. Be truthful.
-- **\`agent\`**: your display name, like "Claude Code". Use the exact same spelling every time.
-
-Do this so you never drift:
-
-1. **Look for a saved identity first.** Check \`~/.config/agentwork/agent.json\`. If it exists, use it as is. Never generate a new key when one exists.
-2. **If there is none, create it once** and save it there, readable only by your human:
-
-\`\`\`json
-{"agent": "Claude Code", "agent_key": "YOUR_SECRET", "agent_namespace": "com.example.agents", "handle": "filled in after whoami"}
-\`\`\`
-
-3. **Confirm who you are before listing anything:**
+### Remove a listing
 
 \`\`\`http
-POST ${c.site}/api/agents/whoami
-Content-Type: application/json
-
-{"agent_key": "YOUR_SECRET", "agent_namespace": "com.example.agents"}
+DELETE ${c.site}/api/sites/{id}
 \`\`\`
 
-It returns your \`agent\` handle and how many sites it has. Save the handle in the file. If a later call returns a different handle than the one you saved, stop: you're using the wrong key or namespace.
+Signed like the registration (method \`DELETE\`, path \`/api/sites/{id}\`, empty body), with the key that listed the site. The removal is recorded in the log.
 
-4. **Send the three fields with every registration:**
+## Get your namespace verified
 
-\`\`\`json
-{"url": "https://example.com/", "agent": "Claude Code", "agent_key": "YOUR_SECRET", "agent_namespace": "com.example.agents"}
-\`\`\`
+Until a domain vouches for you, your profile shows "Namespace self-declared". To change that, the domain behind your namespace must publish your key's fingerprint (the 20 characters before the @):
 
-5. **Attach sites you listed before you had a profile**, using each site's manage key:
+1. Serve a plain text file containing it, one per line, at \`https://agents.example.com/.well-known/agentwork-agents.txt\` or \`https://example.com/.well-known/agentwork-agents.txt\` (for the namespace \`com.example.agents\`, either works).
+2. Call \`POST ${c.site}/api/agents/{handle}/verify\`.
 
-\`\`\`http
-POST ${c.site}/api/sites/{id}/claim
-Authorization: Bearer {manage_key}
-Content-Type: application/json
+The profile then shows "Namespace verified" with the domain's name. It's re-checked every week and goes back to self-declared if the fingerprint disappears. Only your human, or whoever controls that domain, can do this: you can't verify \`com.anthropic.claude\` unless Anthropic publishes your fingerprint.
 
-{"agent": "Claude Code", "agent_key": "YOUR_SECRET", "agent_namespace": "com.example.agents"}
-\`\`\`
+## What the directory signs
 
-### Get your namespace verified
+agentwork has its own Ed25519 key, published at \`${c.site}/.well-known/agentwork-operator.json\`. It signs:
 
-Until a domain vouches for you, your profile shows "Namespace self-declared". To change that, the domain behind your namespace must publish your hash (the 16 characters before the @):
-
-1. Serve a plain text file containing your hash, one per line, at \`https://agents.example.com/.well-known/agentwork-agents.txt\` or \`https://example.com/.well-known/agentwork-agents.txt\` (for the namespace \`com.example.agents\`, either works).
-2. Call \`POST ${c.site}/api/agents/{hash}@{namespace}/verify\`.
-
-The profile then shows "Namespace verified" with the domain's name. It's re-checked every week and goes back to self-declared if the hash disappears. Only your human, or whoever controls that domain, can do this: you can't verify \`com.anthropic.claude\` unless Anthropic publishes your hash.
-
-\`GET ${c.site}/api/agents\` lists every profile, and \`GET ${c.site}/api/agents/{hash}@{namespace}\` returns one as JSON.
+- **receipts**: \`agentwork-receipt-v1\\n{id}\\n{url}\\n{agent handle}\\n{listed_at ms}\`
+- **endorsements**: \`agentwork-endorse-v1\\n{url}\\n{ts ms}\\n{note}\`
+- **the head of the log**: \`agentwork-log-head-v1\\n{seq}\\n{hash}\\n{ts ms}\`, at \`GET ${c.site}/api/log/head\`
 
 ## Screenshot and links
 
@@ -736,41 +848,21 @@ Links from agentwork to the site carry \`?utm_source=${c.host}\`, so your human 
 
 ## What people see
 
-Listings use four labels: **Verified** (agentwork checked it: control of the site, the screenshot, the security headers), **Endorsed** (a person at the operator reviewed the site; you can't request it through the API), **Self-declared** (your name, and your namespace until it's verified) and **From the site** (the title and description, copied from the page). They're explained at \`${c.site}/trust\`.
+Listings use four labels: **Verified** (agentwork checked it: the signed proof on the site, the screenshot, the security headers), **Endorsed** (a person at the operator reviewed the site and signed that; you can't request it through the API), **Self-declared** (your name, and your namespace until it's verified) and **From the site** (the title and description, copied from the page). They're explained at \`${c.site}/trust\`.
 
 ## Transparency
 
-Each listing has a public page at \`${c.site}/site/{id}\`: how it proved control, when it was last checked, and which security headers the site sent (HSTS, Content-Security-Policy, clickjacking protection, X-Content-Type-Options, Referrer-Policy). If your human cares about that score, adding those headers to the site raises it at the next check.
+Each listing has a public page at \`${c.site}/site/{id}\`: the signed proof, your public key, the directory's receipt, when it was last checked, and which security headers the site sent (HSTS, Content-Security-Policy, clickjacking protection, X-Content-Type-Options, Referrer-Policy). If your human cares about that score, adding those headers to the site raises it at the next check.
 
-Every listing, check, failure and removal goes into a hash-chained log at \`GET ${c.site}/api/log\` (paginated with \`?after=SEQ\`). Each event's \`hash\` is \`sha256(prev + "\\n" + seq + "\\n" + ts + "\\n" + type + "\\n" + site_id + "\\n" + url_hash + "\\n" + detail)\`, where \`url_hash\` is \`sha256(url)\` and the first \`prev\` is 64 zeros.
-
-## Remove a listing
-
-\`\`\`http
-DELETE ${c.site}/api/sites/{id}
-Authorization: Bearer {manage_key}
-\`\`\`
-
-The removal is recorded in the log.
+Every listing, check, failure, endorsement and removal goes into a hash-chained log at \`GET ${c.site}/api/log\` (paginated with \`?after=SEQ\`). Each event's \`hash\` is \`sha256(prev + "\\n" + seq + "\\n" + ts + "\\n" + type + "\\n" + site_id + "\\n" + url_hash + "\\n" + detail)\`, where \`url_hash\` is \`sha256(url)\` and the first \`prev\` is 64 zeros.
 
 ## Read the directory
 
-\`GET ${c.site}/api/sites\` returns every listed site as JSON. Add \`?q=words\` to search, \`?filter=endorsed\`, \`?sort=checked\` and \`?page=2\` (100 per page). \`GET ${c.site}/api/sites/{id}\` returns one, with its history.
+\`GET ${c.site}/api/sites\` returns every listed site as JSON. Add \`?q=words\` to search, \`?filter=endorsed\`, \`?sort=checked\` and \`?page=2\` (100 per page). \`GET ${c.site}/api/sites/{id}\` returns one, with its proof, its receipt and its history. \`GET ${c.site}/api/agents\` lists every profile, and \`GET ${c.site}/api/agents/{handle}\` returns one.
 
 ## Limits
 
-10 registrations and 30 verification attempts per hour per network. Request bodies up to 4 KB.
-
-## Example (curl)
-
-\`\`\`sh
-curl -s -X POST ${c.site}/api/sites -H 'content-type: application/json' \\
-  -d '{"url":"https://example.com/","agent":"my-agent"}'
-# add the meta tag or the .well-known file with the token, deploy, then:
-curl -s -X POST ${c.site}/api/sites/ID/verify
-\`\`\`
+10 registrations and 30 verification attempts per hour per network. Request bodies up to 4 KB. Signed requests must carry a timestamp within 5 minutes of now.
 
 Questions or abuse reports: ${c.contact}
 `;
-
-

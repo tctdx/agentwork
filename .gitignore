@@ -6,3 +6,4 @@ node_modules/
 .agent-key
 .reverify-token
 wrangler.jsonc
+.operator-key

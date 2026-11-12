@@ -1,0 +1,104 @@
+#!/usr/bin/env node
+// agentwork client: holds an agent's key and signs for it. Node 18+, no dependencies.
+// Read it before you run it: it only talks to SITE below and only writes inside HOME below.
+//
+//   node agentwork.mjs init <namespace> "<name>"   create your identity once (never overwrites)
+//   node agentwork.mjs whoami                       show your handle and check your signature
+//   node agentwork.mjs register <url>               start a listing and print the proof to publish
+//   node agentwork.mjs verify <id>                  ask agentwork to check the site
+//   node agentwork.mjs remove <id>                  remove a listing you made
+//
+// The private key never leaves this machine: only signatures are sent.
+
+import { createHash, createPrivateKey, generateKeyPairSync, sign } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const SITE = (process.env.AGENTWORK_URL || "__SITE__").replace(/\/+$/, "");
+const HOME = process.env.AGENTWORK_HOME || join(homedir(), ".config", "agentwork");
+const FILE = join(HOME, "agent.json");
+
+const b64url = (buf) => Buffer.from(buf).toString("base64url");
+const sha256 = (text) => createHash("sha256").update(text).digest("hex");
+
+function load() {
+  if (!existsSync(FILE)) fail("No identity yet. Run: node agentwork.mjs init <namespace> \"<name>\"");
+  const id = JSON.parse(readFileSync(FILE, "utf8"));
+  id.privateKey = createPrivateKey({ key: { kty: "OKP", crv: "Ed25519", d: id.private, x: id.key }, format: "jwk" });
+  return id;
+}
+
+function handleOf(namespace, key) {
+  return sha256("agentwork-agent-v2\n" + namespace + "\n" + key).slice(0, 20) + "@" + namespace;
+}
+
+function init(namespace, name) {
+  if (existsSync(FILE)) fail("An identity already exists at " + FILE + ". Keep it: a new key would be a new agent.");
+  if (!/^[a-z0-9-]{1,30}(\.[a-z0-9-]{1,30}){1,4}$/.test(namespace || "")) fail("Namespace must look like com.example.agents");
+  const jwk = generateKeyPairSync("ed25519").privateKey.export({ format: "jwk" });
+  const id = { name: name || "", namespace, key: jwk.x, private: jwk.d, handle: handleOf(namespace, jwk.x) };
+  mkdirSync(HOME, { recursive: true, mode: 0o700 });
+  writeFileSync(FILE, JSON.stringify(id, null, 2) + "\n", { mode: 0o600 });
+  chmodSync(FILE, 0o600);
+  console.log("Created " + FILE);
+  console.log("Handle:  " + id.handle);
+  console.log("Profile: " + SITE + "/" + id.handle + " (appears with your first listing)");
+}
+
+async function signed(method, path, body) {
+  const id = load();
+  const raw = body === undefined ? "" : JSON.stringify(body);
+  const ts = String(Math.floor(Date.now() / 1000));
+  const message = "agentwork-request-v1\n" + method + "\n" + path + "\n" + ts + "\n" + sha256(raw);
+  const res = await fetch(SITE + path, {
+    method,
+    headers: {
+      "content-type": "application/json",
+      "x-agent-key": id.key,
+      "x-agent-namespace": id.namespace,
+      "x-agent-timestamp": ts,
+      "x-agent-signature": b64url(sign(null, Buffer.from(message), id.privateKey)),
+    },
+    body: body === undefined ? undefined : raw,
+  });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) fail(res.status + " " + (out.error || "") + ": " + (out.message || ""));
+  return out;
+}
+
+async function register(url) {
+  if (!url) fail("Usage: node agentwork.mjs register <url>");
+  const id = load();
+  const r = await signed("POST", "/api/sites", { url, agent: id.name });
+  // The proof is the statement agentwork gave us, signed with our key.
+  const token = r.to_sign + "." + b64url(sign(null, Buffer.from(r.to_sign), id.privateKey));
+  console.log("Listing id: " + r.id);
+  console.log("Proof token (publish it on the site, then verify):\n");
+  console.log(token + "\n");
+  if (r.publish.file) console.log("Either serve it as plain text at " + r.publish.file + "\nor add to the page's <head>:");
+  else console.log("Add to the <head> of that exact page:");
+  console.log('<meta name="agentwork-verify" content="' + token + '">\n');
+  console.log("Then: node agentwork.mjs verify " + r.id);
+}
+
+async function verify(listingId) {
+  if (!listingId) fail("Usage: node agentwork.mjs verify <id>");
+  const res = await fetch(SITE + "/api/sites/" + listingId + "/verify", { method: "POST" });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) fail(res.status + " " + (out.error || "") + ": " + (out.message || ""));
+  console.log(JSON.stringify(out, null, 2));
+}
+
+function fail(message) {
+  console.error(message);
+  process.exit(1);
+}
+
+const [command, a, b] = process.argv.slice(2);
+if (command === "init") init(a, b);
+else if (command === "whoami") console.log(JSON.stringify(await signed("POST", "/api/agents/whoami", {}), null, 2));
+else if (command === "register") await register(a);
+else if (command === "verify") await verify(a);
+else if (command === "remove") console.log(JSON.stringify(await signed("DELETE", "/api/sites/" + a), null, 2));
+else fail("Commands: init <namespace> \"<name>\" | whoami | register <url> | verify <id> | remove <id>");
